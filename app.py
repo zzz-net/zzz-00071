@@ -2488,19 +2488,47 @@ class MainApp(tk.Tk):
                 messagebox.showerror("失败", e.message, parent=self)
 
     def _export_stock(self):
-        filename = generate_default_filename("stock_details")
-        path = filedialog.asksaveasfilename(
-            parent=self, title="导出库存明细", defaultextension=".csv",
-            initialfile=filename, filetypes=[("CSV文件", "*.csv")]
-        )
-        if path:
-            try:
-                count = export_stock_details(path)
-                messagebox.showinfo("成功", f"已导出 {count} 条库存记录到:\n{path}", parent=self)
-            except Exception as e:
-                messagebox.showerror("错误", f"导出失败: {e}", parent=self)
+        if not self.current_user:
+            return
+        keyword = self.parts_keyword.get().strip() or None
+        category = self.parts_category.get().strip() or None
+        filters = {}
+        if keyword:
+            filters["keyword"] = keyword
+        if category:
+            filters["category"] = category
+        snapshot = ExportTaskSnapshot(filters=filters)
+        try:
+            task = submit_export_task(self.current_user["id"], TASK_TYPE_STOCK, snapshot)
+            messagebox.showinfo("任务已提交",
+                                f"库存明细导出任务已提交到任务中心\n任务编号: {task['task_no']}\n"
+                                f"预计 {task['record_count']} 条记录\n"
+                                f"请在「导出任务中心」查看进度并下载",
+                                parent=self)
+            self._et_refresh_tasks(silent=True)
+        except BusinessException as e:
+            self._handle_export_conflict(e, TASK_TYPE_STOCK, snapshot)
+
+    def _handle_export_conflict(self, e, task_type, snapshot):
+        if "冲突" in e.message or "相同条件" in e.message:
+            if messagebox.askyesno("冲突提示",
+                                   f"{e.message}\n\n是否强制提交（将取消已有任务）？",
+                                   parent=self):
+                try:
+                    task = submit_export_task(self.current_user["id"], task_type, snapshot, force=True)
+                    messagebox.showinfo("任务已提交",
+                                        f"导出任务已强制提交\n任务编号: {task['task_no']}\n"
+                                        f"预计 {task['record_count']} 条记录",
+                                        parent=self)
+                    self._et_refresh_tasks(silent=True)
+                except BusinessException as ex:
+                    messagebox.showerror("提交失败", ex.message, parent=self)
+        else:
+            messagebox.showerror("提交失败", e.message, parent=self)
 
     def _export_borrow(self):
+        if not self.current_user:
+            return
         status_label = self.borrow_status.get()
         status = self._status_map.get(status_label, "")
         status = status or None
@@ -2520,42 +2548,50 @@ class MainApp(tk.Tk):
             filters["date_from"] = date_from
         if date_to:
             filters["date_to"] = date_to
-        filename = generate_default_filename("borrow_records")
-        path = filedialog.asksaveasfilename(
-            parent=self, title="导出借还记录", defaultextension=".csv",
-            initialfile=filename, filetypes=[("CSV文件", "*.csv")]
+        columns = list(self.borrow_tree["columns"]) if hasattr(self, 'borrow_tree') else []
+        snapshot = ExportTaskSnapshot(
+            filters=filters,
+            columns=columns,
         )
-        if path:
-            try:
-                count = export_borrow_records(path, status=status, borrower_id=borrower_id,
-                                              keyword=keyword, date_from=date_from, date_to=date_to)
-                scheme_id = self.active_scheme_id if hasattr(self, 'active_scheme_id') else None
-                if self.current_user:
-                    log_export_operation(self.current_user["id"], filters, count,
-                                         os.path.basename(path), scheme_id)
-                scheme_note = ""
-                if self.active_scheme_id:
-                    scheme = get_filter_scheme_by_id(self.active_scheme_id)
-                    if scheme:
-                        scheme_note = f" (按方案「{scheme['name']}」筛选)"
-                messagebox.showinfo("成功", f"已导出 {count} 条记录到:\n{path}{scheme_note}", parent=self)
-            except Exception as e:
-                messagebox.showerror("错误", f"导出失败: {e}", parent=self)
+        try:
+            task = submit_export_task(self.current_user["id"], TASK_TYPE_BORROW, snapshot)
+            scheme_note = ""
+            if self.active_scheme_id:
+                scheme = get_filter_scheme_by_id(self.active_scheme_id)
+                if scheme:
+                    scheme_note = f"\n筛选方案: 「{scheme['name']}」"
+            messagebox.showinfo("任务已提交",
+                                f"借还记录导出任务已提交到任务中心\n任务编号: {task['task_no']}\n"
+                                f"预计 {task['record_count']} 条记录{scheme_note}\n"
+                                f"请在「导出任务中心」查看进度并下载",
+                                parent=self)
+            self._et_refresh_tasks(silent=True)
+        except BusinessException as e:
+            self._handle_export_conflict(e, TASK_TYPE_BORROW, snapshot)
 
     def _export_history(self):
+        if not self.current_user:
+            return
         label = self.history_part.get()
         part_id = self.history_part_map.get(label)
-        filename = generate_default_filename("stock_logs")
-        path = filedialog.asksaveasfilename(
-            parent=self, title="导出库存变动历史", defaultextension=".csv",
-            initialfile=filename, filetypes=[("CSV文件", "*.csv")]
+        filters = {}
+        if part_id:
+            filters["part_id"] = part_id
+        columns = list(self.history_tree["columns"]) if hasattr(self, 'history_tree') else []
+        snapshot = ExportTaskSnapshot(
+            filters=filters,
+            columns=columns,
         )
-        if path:
-            try:
-                count = export_stock_logs(path, part_id)
-                messagebox.showinfo("成功", f"已导出 {count} 条变动记录到:\n{path}", parent=self)
-            except Exception as e:
-                messagebox.showerror("错误", f"导出失败: {e}", parent=self)
+        try:
+            task = submit_export_task(self.current_user["id"], TASK_TYPE_STOCK_LOG, snapshot)
+            messagebox.showinfo("任务已提交",
+                                f"库存变动导出任务已提交到任务中心\n任务编号: {task['task_no']}\n"
+                                f"预计 {task['record_count']} 条记录\n"
+                                f"请在「导出任务中心」查看进度并下载",
+                                parent=self)
+            self._et_refresh_tasks(silent=True)
+        except BusinessException as e:
+            self._handle_export_conflict(e, TASK_TYPE_STOCK_LOG, snapshot)
 
     def _set_status(self, text):
         self.status_label.configure(text=text)
