@@ -537,11 +537,11 @@ class MainApp(tk.Tk):
         ttk.Label(row2, text="开始日期:").pack(side="left")
         self.date_from_var = tk.StringVar()
         ttk.Entry(row2, textvariable=self.date_from_var, width=14).pack(side="left", padx=5)
-        ttk.Label(row2, text="(如 2025-01-01)").pack(side="left", foreground="#909399")
+        ttk.Label(row2, text="(如 2025-01-01)", foreground="#909399").pack(side="left")
         ttk.Label(row2, text="结束日期:").pack(side="left", padx=(15, 0))
         self.date_to_var = tk.StringVar()
         ttk.Entry(row2, textvariable=self.date_to_var, width=14).pack(side="left", padx=5)
-        ttk.Label(row2, text="(如 2025-12-31)").pack(side="left", foreground="#909399")
+        ttk.Label(row2, text="(如 2025-12-31)", foreground="#909399").pack(side="left")
         ttk.Button(row2, text="查询", command=self._refresh_borrow, width=8).pack(side="left", padx=10)
         ttk.Button(row2, text="重置", command=self._reset_borrow_filter, width=8).pack(side="left", padx=2)
 

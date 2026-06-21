@@ -492,12 +492,14 @@ def get_borrow_records(status=None, part_id=None, borrower_id=None, keyword=None
             sql += " AND (br.record_no LIKE ? OR sp.part_code LIKE ? OR sp.part_name LIKE ?)"
             kw = f"%{keyword}%"
             params.extend([kw, kw, kw])
-        if date_from:
+        norm_date_from = _normalize_date_from(date_from)
+        if norm_date_from:
             sql += " AND br.created_at >= ?"
-            params.append(date_from)
-        if date_to:
+            params.append(norm_date_from)
+        norm_date_to = _normalize_date_to(date_to)
+        if norm_date_to:
             sql += " AND br.created_at <= ?"
-            params.append(date_to)
+            params.append(norm_date_to)
         sql += " ORDER BY br.created_at DESC"
         rows = conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
@@ -594,6 +596,28 @@ def _is_filter_empty(filters):
         if v is not None and v != "" and v != [] and v != ():
             return False
     return True
+
+
+def _normalize_date_to(date_to):
+    if not date_to:
+        return None
+    stripped = date_to.strip()
+    if not stripped:
+        return None
+    if len(stripped) == 10 and stripped[4] == "-" and stripped[7] == "-":
+        return stripped + "T23:59:59.999999"
+    return stripped
+
+
+def _normalize_date_from(date_from):
+    if not date_from:
+        return None
+    stripped = date_from.strip()
+    if not stripped:
+        return None
+    if len(stripped) == 10 and stripped[4] == "-" and stripped[7] == "-":
+        return stripped + "T00:00:00"
+    return stripped
 
 
 def save_user_preference(user_id, pref_key, pref_value):
@@ -709,9 +733,14 @@ def delete_filter_scheme(scheme_id, user_id, role):
                 raise BusinessException("不能删除他人的个人方案")
             else:
                 raise BusinessException("只有主管可以删除共享方案")
+        scheme_name = scheme["name"]
         conn.execute("DELETE FROM filter_schemes WHERE id = ?", (scheme_id,))
+        conn.execute(
+            "DELETE FROM user_preferences WHERE pref_key = 'last_active_scheme_id' AND pref_value = ?",
+            (str(scheme_id),)
+        )
         log_operation(conn, user_id, "delete_filter_scheme", "filter_scheme", scheme_id,
-                      f"删除筛选方案: {scheme['name']}")
+                      f"删除筛选方案: {scheme_name}")
 
 
 def get_filter_scheme_by_id(scheme_id):

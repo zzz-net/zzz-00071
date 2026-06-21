@@ -19,7 +19,8 @@ from services import (
     submit_borrow, get_all_parts, BusinessException, _is_filter_empty,
     _serialize_filters, _deserialize_filters,
     save_user_preference, get_user_preference,
-    set_active_scheme_id, get_active_scheme_id
+    set_active_scheme_id, get_active_scheme_id,
+    _normalize_date_from, _normalize_date_to
 )
 from exporter import export_borrow_records
 
@@ -508,6 +509,156 @@ def test_scheme_list_and_log_export_triplet_consistency():
     os.remove(export_path)
 
 
+def test_date_normalize_helpers():
+    print("\n=== 测试20: 日期标准化辅助函数 ===")
+    assert_eq("date_from 纯日期补 T00:00:00",
+              _normalize_date_from("2025-06-21"), "2025-06-21T00:00:00")
+    assert_eq("date_to 纯日期补 T23:59:59.999999",
+              _normalize_date_to("2025-06-21"), "2025-06-21T23:59:59.999999")
+    assert_eq("date_from None 返回 None", _normalize_date_from(None), None)
+    assert_eq("date_to None 返回 None", _normalize_date_to(None), None)
+    assert_eq("date_from 空串返回 None", _normalize_date_from(""), None)
+    assert_eq("date_to 空串返回 None", _normalize_date_to(""), None)
+    assert_eq("date_from 已含时间戳原样返回",
+              _normalize_date_from("2025-06-21T10:30:00"), "2025-06-21T10:30:00")
+    assert_eq("date_to 已含时间戳原样返回",
+              _normalize_date_to("2025-06-21T18:00:00"), "2025-06-21T18:00:00")
+
+
+def test_delete_scheme_clears_all_user_prefs():
+    print("\n=== 测试21: 删除方案时清理所有用户的激活偏好 ===")
+    users = get_all_users()
+    supervisor = [u for u in users if u["role"] == "supervisor"][0]
+    operators = [u for u in users if u["role"] == "operator"]
+    if len(operators) < 2:
+        print("  SKIP: 需要至少两个操作员用户")
+        return
+
+    sid = save_filter_scheme("共享清理偏好测试", supervisor["id"],
+                             {"keyword": "cleanup"}, scope="shared",
+                             role="supervisor")
+
+    set_active_scheme_id(supervisor["id"], sid)
+    set_active_scheme_id(operators[0]["id"], sid)
+    set_active_scheme_id(operators[1]["id"], sid)
+
+    assert_eq("主管激活方案已设置", get_active_scheme_id(supervisor["id"]), sid)
+    assert_eq("操作员1激活方案已设置", get_active_scheme_id(operators[0]["id"]), sid)
+    assert_eq("操作员2激活方案已设置", get_active_scheme_id(operators[1]["id"]), sid)
+
+    delete_filter_scheme(sid, supervisor["id"], "supervisor")
+
+    assert_true("主管偏好已被清理", get_active_scheme_id(supervisor["id"]) is None)
+    assert_true("操作员1偏好已被清理", get_active_scheme_id(operators[0]["id"]) is None)
+    assert_true("操作员2偏好已被清理", get_active_scheme_id(operators[1]["id"]) is None)
+
+
+def test_borrow_date_filter_covers_same_day():
+    print("\n=== 测试22: 日期筛选包含当天所有记录 ===")
+    users = get_all_users()
+    supervisor = [u for u in users if u["role"] == "supervisor"][0]
+    parts = get_all_parts()
+    if not parts:
+        print("  SKIP: 没有备件数据")
+        return
+    part = parts[0]
+    if part["available_stock"] < 2:
+        print("  SKIP: 备件库存不足")
+        return
+
+    before_count = len(get_borrow_records())
+    rid1 = submit_borrow(part["id"], supervisor["id"], 1, "日期测试1")
+    rid2 = submit_borrow(part["id"], supervisor["id"], 1, "日期测试2")
+
+    from database import get_connection
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    all_today = get_borrow_records(date_from=today, date_to=today)
+    assert_true("按当天筛选能查到刚创建的记录", len(all_today) >= 2)
+
+    record_nos = [r["record_no"] for r in all_today]
+    from services import get_borrow_record
+    r1 = get_borrow_record(rid1)
+    r2 = get_borrow_record(rid2)
+    assert_true("记录1在当天筛选结果中", r1["record_no"] in record_nos)
+    assert_true("记录2在当天筛选结果中", r2["record_no"] in record_nos)
+
+
+def test_export_and_query_identical_real_data():
+    print("\n=== 测试23: 真实数据下CSV导出与页面查询完全一致 ===")
+    users = get_all_users()
+    supervisor = [u for u in users if u["role"] == "supervisor"][0]
+    parts = get_all_parts()
+    if not parts:
+        print("  SKIP: 没有备件数据")
+        return
+    part = parts[0]
+    if part["available_stock"] < 1:
+        print("  SKIP: 备件无库存")
+        return
+
+    submit_borrow(part["id"], supervisor["id"], 1, "导出一致性测试")
+
+    filters = {"status": "approved", "borrower_id": supervisor["id"]}
+    list_result = get_borrow_records(**filters)
+    assert_true("查询有结果", len(list_result) >= 1)
+
+    export_path = os.path.join(TEST_DB_DIR, "test_identical_export.csv")
+    export_count = export_borrow_records(export_path, **filters)
+    assert_eq("导出数量与列表数量完全一致", export_count, len(list_result))
+
+    with open(export_path, "r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        csv_rows = list(reader)
+    assert_eq("CSV数据行数与列表一致", len(csv_rows), len(list_result))
+
+    csv_record_nos = sorted([r["记录编号"] for r in csv_rows])
+    list_record_nos = sorted([r["record_no"] for r in list_result])
+    assert_eq("CSV与列表的记录编号集合完全一致", csv_record_nos, list_record_nos)
+
+    os.remove(export_path)
+
+
+def test_operation_log_traceability_for_scheme_operations():
+    print("\n=== 测试24: 方案关键操作日志完整可追溯 ===")
+    from services import get_operation_logs
+    users = get_all_users()
+    supervisor = [u for u in users if u["role"] == "supervisor"][0]
+
+    before_logs = get_operation_logs(limit=500)
+
+    sid = save_filter_scheme("追溯测试方案", supervisor["id"],
+                             {"keyword": "trace"}, scope="personal",
+                             role="supervisor")
+    save_filter_scheme("追溯测试方案-已更新", supervisor["id"],
+                       {"keyword": "trace2"}, scope="personal",
+                       scheme_id=sid, role="supervisor")
+    delete_filter_scheme(sid, supervisor["id"], "supervisor")
+
+    after_logs = get_operation_logs(limit=500)
+    new_logs = after_logs[:len(after_logs) - len(before_logs)] if len(after_logs) > len(before_logs) else after_logs
+
+    actions_found = {}
+    for log in after_logs:
+        detail = log.get("detail") or ""
+        if log["action"] == "save_filter_scheme" and "追溯测试方案" in detail and log["target_id"] == sid:
+            actions_found["save"] = True
+        if log["action"] == "update_filter_scheme" and "追溯测试方案-已更新" in detail and log["target_id"] == sid:
+            actions_found["update"] = True
+        if log["action"] == "delete_filter_scheme" and "追溯测试方案" in detail and log["target_id"] == sid:
+            actions_found["delete"] = True
+
+    assert_true("保存方案操作日志存在", actions_found.get("save", False))
+    assert_true("更新方案操作日志存在", actions_found.get("update", False))
+    assert_true("删除方案操作日志存在", actions_found.get("delete", False))
+
+    for log in after_logs:
+        if log["action"] in ("save_filter_scheme", "update_filter_scheme", "delete_filter_scheme") and log.get("target_id") == sid:
+            assert_eq(f"操作 {log['action']} 均为成功", log["success"], 1)
+            assert_eq(f"操作 {log['action']} 操作人正确", log["operator_name"], supervisor["display_name"])
+
+
 if __name__ == "__main__":
     try:
         init_db()
@@ -531,6 +682,11 @@ if __name__ == "__main__":
         test_same_name_update_excludes_self()
         test_different_users_same_name_personal()
         test_scheme_list_and_log_export_triplet_consistency()
+        test_date_normalize_helpers()
+        test_delete_scheme_clears_all_user_prefs()
+        test_borrow_date_filter_covers_same_day()
+        test_export_and_query_identical_real_data()
+        test_operation_log_traceability_for_scheme_operations()
         print(f"\n{'='*60}")
         print(f"测试完成: {passed} 通过, {failed} 失败")
         print(f"{'='*60}")
