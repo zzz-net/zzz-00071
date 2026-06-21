@@ -61,9 +61,9 @@ def get_all_parts(keyword=None, category=None):
     with get_connection() as conn:
         sql = """
             SELECT sp.*,
-                (SELECT COUNT(*) FROM borrow_records br
+                (SELECT COALESCE(SUM(br.quantity), 0) FROM borrow_records br
                     WHERE br.part_id = sp.id AND br.status = 'pending_approval') AS pending_count,
-                (SELECT COUNT(*) FROM borrow_records br
+                (SELECT COALESCE(SUM(br.quantity - br.return_quantity), 0) FROM borrow_records br
                     WHERE br.part_id = sp.id AND br.status IN ('approved', 'borrowed')) AS borrowed_count
             FROM spare_parts sp
             WHERE sp.status = 'active'
@@ -91,7 +91,15 @@ def get_all_categories():
 
 def get_part_by_id(part_id):
     with get_connection() as conn:
-        row = conn.execute("SELECT * FROM spare_parts WHERE id = ?", (part_id,)).fetchone()
+        row = conn.execute("""
+            SELECT sp.*,
+                (SELECT COALESCE(SUM(br.quantity), 0) FROM borrow_records br
+                    WHERE br.part_id = sp.id AND br.status = 'pending_approval') AS pending_count,
+                (SELECT COALESCE(SUM(br.quantity - br.return_quantity), 0) FROM borrow_records br
+                    WHERE br.part_id = sp.id AND br.status IN ('approved', 'borrowed')) AS borrowed_count
+            FROM spare_parts sp
+            WHERE sp.id = ?
+        """, (part_id,)).fetchone()
         return dict(row) if row else None
 
 
@@ -351,6 +359,51 @@ def return_part(record_id, operator_id, return_quantity=None, remark=""):
               operator_id, remark or "归还入库", now))
         log_operation(conn, operator_id, "return_part", "borrow_record", record_id,
                       f"归还 {record['record_no']} x{return_quantity}, 剩余未还: {record['quantity'] - new_return_quantity}")
+
+
+def undo_return(record_id, operator_id, remark=""):
+    with get_connection() as conn:
+        record = conn.execute("SELECT * FROM borrow_records WHERE id = ?", (record_id,)).fetchone()
+        if not record:
+            raise BusinessException("借用记录不存在")
+        if record["status"] != "returned":
+            log_failure_operation(operator_id, "undo_return", "borrow_record", record_id,
+                                  f"撤销归还 {record['record_no']}",
+                                  error_message=f"记录状态为{record['status']}, 非已归还状态")
+            raise BusinessException(
+                f"该记录状态为 {record['status']}，无法执行撤销归还操作"
+            )
+        part = conn.execute("SELECT * FROM spare_parts WHERE id = ?", (record["part_id"],)).fetchone()
+        undo_quantity = record["return_quantity"]
+        if undo_quantity <= 0:
+            log_failure_operation(operator_id, "undo_return", "borrow_record", record_id,
+                                  f"撤销归还 {record['record_no']}",
+                                  error_message=f"可撤销数量无效: {undo_quantity}")
+            raise BusinessException("无可撤销的归还数量")
+        if undo_quantity > part["available_stock"]:
+            log_failure_operation(operator_id, "undo_return", "borrow_record", record_id,
+                                  f"撤销归还 {record['record_no']}",
+                                  error_message=f"库存不足: 可用{part['available_stock']}, 需撤销{undo_quantity}")
+            raise BusinessException(
+                f"可用库存不足，无法撤销归还，当前可用: {part['available_stock']}{part['unit']}"
+            )
+        now = datetime.now().isoformat()
+        before = part["available_stock"]
+        after = before - undo_quantity
+        conn.execute("""
+            UPDATE spare_parts SET available_stock=?, updated_at=? WHERE id=?
+        """, (after, now, record["part_id"]))
+        conn.execute("""
+            UPDATE borrow_records SET return_quantity=0, status='borrowed', updated_at=? WHERE id=?
+        """, (now, record_id))
+        conn.execute("""
+            INSERT INTO stock_logs (part_id, record_id, operation_type, quantity_change,
+                before_available, after_available, operator_id, remark, created_at)
+            VALUES (?, ?, 'return', ?, ?, ?, ?, ?, ?)
+        """, (record["part_id"], record_id, -undo_quantity, before, after,
+              operator_id, remark or "撤销归还", now))
+        log_operation(conn, operator_id, "undo_return", "borrow_record", record_id,
+                      f"撤销归还 {record['record_no']} x{undo_quantity}, 恢复为已借出状态")
 
 
 def rollback_borrow(record_id, operator_id, remark=""):
