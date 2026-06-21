@@ -17,12 +17,12 @@ db_mod.DB_PATH = REGRESSION_DB_PATH
 from database import init_db, seed_sample_data, get_connection
 from services import (
     get_all_users, get_borrow_records, get_all_parts, BusinessException,
-    get_operation_logs, submit_borrow
+    get_operation_logs, submit_borrow, adjust_stock, update_part
 )
 from export_task_center import (
     ExportTaskSnapshot, submit_export_task, get_export_task,
     get_export_task_by_no, get_user_export_tasks, get_recent_export_tasks,
-    cancel_export_task, retry_export_task,
+    cancel_export_task, retry_export_task, confirm_pending_task,
     check_download_availability, verify_export_task_consistency,
     process_pending_tasks, recover_incomplete_tasks,
     check_conflict, _compute_data_fingerprint, _query_records_for_task,
@@ -863,6 +863,449 @@ def test_xlsx_consistency_verify_with_columns():
               f"文件行数={result.get('csv_count')} 当前={result.get('current_count')}")
 
 
+def _read_csv_rows(file_path):
+    with open(file_path, "r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        return list(reader)
+
+
+def _read_xlsx_cell_values(xlsx_path):
+    import zipfile, re
+    with zipfile.ZipFile(xlsx_path, "r") as z:
+        with z.open("xl/worksheets/sheet1.xml") as f:
+            xml = f.read().decode("utf-8", errors="ignore")
+    return re.findall(r"<t>([^<]*)</t>", xml)
+
+
+def test_stock_name_change_detected_after_submit():
+    print("\n=== 假一致回归: 提交库存导出后修改备件名称，指纹必须变化 ===")
+    users = get_all_users()
+    op = [u for u in users if u["role"] == "operator"][0]
+
+    parts = get_all_parts()
+    assert_true("有可测备件", len(parts) > 0)
+    target = parts[0]
+    original_name = target["part_name"]
+
+    snap = ExportTaskSnapshot(
+        filters={},
+        columns=["part_code", "part_name", "available_stock"],
+        export_format=FORMAT_CSV,
+    )
+    task = submit_export_task(op["id"], TASK_TYPE_STOCK, snap)
+    fp_at_submit = task["data_fingerprint"]
+
+    process_pending_tasks()
+    done = get_export_task(task["id"])
+    assert_eq("首次导出成功", done["status"], TASK_STATUS_SUCCESS)
+
+    result_before = verify_export_task_consistency(task["id"])
+    assert_true("修改前一致性通过", result_before["consistent"])
+
+    update_part(target["id"], {
+        "part_code": target["part_code"],
+        "part_name": original_name + "_MODIFIED",
+        "category": target.get("category", ""),
+        "specification": target.get("specification", ""),
+        "unit": target.get("unit", "个"),
+        "unit_price": target.get("unit_price", 0),
+        "requires_approval": target.get("requires_approval", 0),
+        "approval_threshold": target.get("approval_threshold", 0),
+    }, op["id"])
+
+    current_records = _query_records_for_task(TASK_TYPE_STOCK, {})
+    fp_after = _compute_data_fingerprint(current_records)
+    assert_true("修改名称后指纹变化", fp_after != fp_at_submit)
+
+    result_after = verify_export_task_consistency(task["id"])
+    assert_false("修改后一致性不通过", result_after["consistent"])
+    assert_true("原因包含变化", "变化" in result_after["reason"])
+
+    snap2 = ExportTaskSnapshot(
+        filters={},
+        columns=["part_code", "part_name", "available_stock"],
+        export_format=FORMAT_CSV,
+    )
+    task2 = submit_export_task(op["id"], TASK_TYPE_STOCK, snap2)
+    process_pending_tasks()
+    done2 = get_export_task(task2["id"])
+    assert_eq("重新提交后导出成功", done2["status"], TASK_STATUS_SUCCESS)
+
+    rows = _read_csv_rows(done2["export_file_path"])
+    found_modified = any(
+        row.get("备件名称", "") == original_name + "_MODIFIED"
+        for row in rows
+    )
+    assert_true("重新导出CSV包含修改后名称", found_modified)
+
+
+def test_stock_quantity_change_detected_after_submit():
+    print("\n=== 假一致回归: 提交库存导出后调整库存数量，指纹必须变化 ===")
+    users = get_all_users()
+    op = [u for u in users if u["role"] == "operator"][0]
+
+    parts = get_all_parts()
+    assert_true("有可测备件", len(parts) > 0)
+    target = None
+    for p in parts:
+        if p["available_stock"] >= 1:
+            target = p
+            break
+    assert_true("有可用库存>=1的备件", target is not None)
+
+    snap = ExportTaskSnapshot(
+        filters={},
+        columns=["part_code", "part_name", "available_stock"],
+        export_format=FORMAT_CSV,
+    )
+    task = submit_export_task(op["id"], TASK_TYPE_STOCK, snap)
+    fp_at_submit = task["data_fingerprint"]
+
+    process_pending_tasks()
+    done = get_export_task(task["id"])
+    assert_eq("首次导出成功", done["status"], TASK_STATUS_SUCCESS)
+
+    result_before = verify_export_task_consistency(task["id"])
+    assert_true("调整前一致性通过", result_before["consistent"])
+
+    adjust_stock(target["id"], -1, op["id"], "回归测试调减库存")
+
+    current_records = _query_records_for_task(TASK_TYPE_STOCK, {})
+    fp_after = _compute_data_fingerprint(current_records)
+    assert_true("调减库存后指纹变化", fp_after != fp_at_submit)
+
+    result_after = verify_export_task_consistency(task["id"])
+    assert_false("调减后一致性不通过", result_after["consistent"])
+
+
+def test_borrow_new_record_after_submit_changes_fingerprint():
+    print("\n=== 假一致回归: 提交借还导出后新增借用记录，指纹必须变化 ===")
+    users = get_all_users()
+    sup = [u for u in users if u["role"] == "supervisor"][0]
+
+    parts = get_all_parts()
+    assert_true("有可测备件", len(parts) > 0)
+    target = None
+    for p in parts:
+        if p["available_stock"] >= 2:
+            target = p
+            break
+    if target is None:
+        for p in parts:
+            if p["available_stock"] >= 1:
+                target = p
+                break
+    assert_true("有可用库存的备件", target is not None)
+
+    filters = {"status": "approved"}
+    snap = ExportTaskSnapshot(filters=filters, export_format=FORMAT_CSV)
+    task = submit_export_task(sup["id"], TASK_TYPE_BORROW, snap)
+    fp_at_submit = task["data_fingerprint"]
+
+    process_pending_tasks()
+    done = get_export_task(task["id"])
+    assert_eq("首次导出成功", done["status"], TASK_STATUS_SUCCESS)
+
+    result_before = verify_export_task_consistency(task["id"])
+    assert_true("新增前一致性通过", result_before["consistent"])
+
+    submit_borrow(target["id"], sup["id"], 1, "假一致回归新增借用")
+
+    current_records = _query_records_for_task(TASK_TYPE_BORROW, filters)
+    fp_after = _compute_data_fingerprint(current_records)
+    assert_true("新增借用后指纹变化", fp_after != fp_at_submit)
+
+    result_after = verify_export_task_consistency(task["id"])
+    assert_false("新增借用后一致性不通过", result_after["consistent"])
+
+
+def test_export_csv_content_asserts_real_field_values():
+    print("\n=== 假一致回归: CSV导出内容字段值断言 ===")
+    users = get_all_users()
+    sup = [u for u in users if u["role"] == "supervisor"][0]
+
+    parts = get_all_parts()
+    assert_true("有可测备件", len(parts) > 0)
+
+    snap = ExportTaskSnapshot(
+        filters={},
+        columns=["part_code", "part_name", "available_stock"],
+        export_format=FORMAT_CSV,
+    )
+    task = submit_export_task(sup["id"], TASK_TYPE_STOCK, snap)
+    process_pending_tasks()
+    done = get_export_task(task["id"])
+    assert_eq("CSV导出成功", done["status"], TASK_STATUS_SUCCESS)
+
+    rows = _read_csv_rows(done["export_file_path"])
+    assert_true("CSV有数据行", len(rows) > 0)
+
+    assert_true("CSV头部含备件编码", "备件编码" in rows[0] or "part_code" in rows[0])
+    assert_true("CSV头部含备件名称", "备件名称" in rows[0] or "part_name" in rows[0])
+    assert_true("CSV头部含可用库存", "可用库存" in rows[0] or "available_stock" in rows[0])
+
+    part_codes_in_csv = {row.get("备件编码", row.get("part_code", "")) for row in rows}
+    db_part_codes = {p["part_code"] for p in get_all_parts()}
+    overlap = part_codes_in_csv & db_part_codes
+    assert_true("CSV字段值来自真实数据", len(overlap) > 0)
+
+
+def test_export_xlsx_content_asserts_real_field_values():
+    print("\n=== 假一致回归: XLSX导出内容字段值断言 ===")
+    users = get_all_users()
+    sup = [u for u in users if u["role"] == "supervisor"][0]
+
+    snap = ExportTaskSnapshot(
+        filters={},
+        columns=["part_code", "part_name", "category", "available_stock"],
+        export_format=FORMAT_XLSX,
+    )
+    task = submit_export_task(sup["id"], TASK_TYPE_STOCK, snap)
+    process_pending_tasks()
+    done = get_export_task(task["id"])
+    assert_eq("XLSX导出成功", done["status"], TASK_STATUS_SUCCESS)
+
+    xlsx_path = done["export_file_path"]
+    assert_true("XLSX文件存在", os.path.exists(xlsx_path))
+
+    cell_values = _read_xlsx_cell_values(xlsx_path)
+    assert_true("XLSX有单元格数据", len(cell_values) >= 4)
+
+    header_cells = cell_values[:4]
+    assert_true("XLSX头部含备件编码", "备件编码" in header_cells)
+    assert_true("XLSX头部含备件名称", "备件名称" in header_cells)
+    assert_true("XLSX头部含可用库存", "可用库存" in header_cells)
+
+    db_part_codes = {p["part_code"] for p in get_all_parts()}
+    xlsx_codes = [v for v in cell_values if v in db_part_codes]
+    assert_true("XLSX内容包含真实备件编码", len(xlsx_codes) > 0)
+
+
+def test_pending_confirmation_confirm_updates_fingerprint_and_export():
+    print("\n=== 假一致回归: pending_confirmation -> 确认后指纹更新+重新导出 ===")
+    users = get_all_users()
+    sup = [u for u in users if u["role"] == "supervisor"][0]
+
+    snap = ExportTaskSnapshot(
+        filters={"keyword": _ukw()},
+        columns=["part_code", "part_name", "available_stock"],
+        export_format=FORMAT_CSV,
+    )
+    task = submit_export_task(sup["id"], TASK_TYPE_STOCK, snap)
+    fp_original = task["data_fingerprint"]
+
+    with get_connection() as conn:
+        conn.execute("UPDATE export_tasks SET data_fingerprint = 'tampered_fp' WHERE id = ?",
+                     (task["id"],))
+
+    process_pending_tasks()
+
+    after_block = get_export_task(task["id"])
+    assert_eq("被拦截为待确认", after_block["status"], TASK_STATUS_PENDING_CONFIRMATION)
+    assert_true("错误信息含变化", "变化" in (after_block.get("error_message") or ""))
+
+    confirmed = confirm_pending_task(task["id"], sup["id"])
+    assert_eq("确认后状态为pending", confirmed["status"], TASK_STATUS_PENDING)
+    assert_true("确认后指纹已更新", confirmed["data_fingerprint"] != "tampered_fp")
+    assert_eq("确认后错误信息清空", confirmed.get("error_message"), None)
+
+    process_pending_tasks()
+    final = get_export_task(task["id"])
+    assert_eq("确认后导出成功", final["status"], TASK_STATUS_SUCCESS)
+    assert_true("确认后导出文件存在", os.path.exists(final["export_file_path"]))
+
+    result = verify_export_task_consistency(task["id"])
+    assert_true("确认后一致性通过", result["consistent"])
+
+
+def test_pending_confirmation_retry_updates_fingerprint_and_export():
+    print("\n=== 假一致回归: pending_confirmation -> 重试后指纹更新+重新导出 ===")
+    users = get_all_users()
+    op = [u for u in users if u["role"] == "operator"][0]
+
+    snap = ExportTaskSnapshot(
+        filters={"keyword": _ukw()},
+        columns=["part_code", "part_name", "available_stock"],
+        export_format=FORMAT_XLSX,
+    )
+    task = submit_export_task(op["id"], TASK_TYPE_STOCK, snap)
+
+    with get_connection() as conn:
+        conn.execute("UPDATE export_tasks SET data_fingerprint = 'tampered_retry_fp' WHERE id = ?",
+                     (task["id"],))
+
+    process_pending_tasks()
+
+    after_block = get_export_task(task["id"])
+    assert_eq("被拦截为待确认", after_block["status"], TASK_STATUS_PENDING_CONFIRMATION)
+
+    retried = retry_export_task(task["id"], op["id"])
+    assert_eq("重试后状态为pending", retried["status"], TASK_STATUS_PENDING)
+    assert_true("重试后指纹已更新", retried["data_fingerprint"] != "tampered_retry_fp")
+    assert_eq("重试后错误信息清空", retried.get("error_message"), None)
+
+    process_pending_tasks()
+    final = get_export_task(task["id"])
+    assert_eq("重试后导出成功", final["status"], TASK_STATUS_SUCCESS)
+    assert_true("重试后文件存在", os.path.exists(final["export_file_path"]))
+    assert_true("重试后为xlsx格式", final["export_file_path"].endswith(".xlsx"))
+
+    result = verify_export_task_consistency(task["id"])
+    assert_true("重试后一致性通过", result["consistent"])
+
+
+def test_pending_confirmation_resubmit_creates_new_task():
+    print("\n=== 假一致回归: pending_confirmation -> 重新提交创建新任务 ===")
+    users = get_all_users()
+    sup = [u for u in users if u["role"] == "supervisor"][0]
+
+    snap = ExportTaskSnapshot(
+        filters={"keyword": _ukw()},
+        columns=["part_code", "part_name", "available_stock"],
+        export_format=FORMAT_CSV,
+    )
+    task = submit_export_task(sup["id"], TASK_TYPE_STOCK, snap)
+
+    with get_connection() as conn:
+        conn.execute("UPDATE export_tasks SET data_fingerprint = 'tampered_resub_fp' WHERE id = ?",
+                     (task["id"],))
+
+    process_pending_tasks()
+
+    after_block = get_export_task(task["id"])
+    assert_eq("被拦截为待确认", after_block["status"], TASK_STATUS_PENDING_CONFIRMATION)
+
+    new_task = resubmit_as_new(task["id"], sup["id"])
+    assert_true("重新提交生成新ID", new_task["id"] != task["id"])
+    assert_eq("新任务状态为pending", new_task["status"], TASK_STATUS_PENDING)
+    assert_true("新任务指纹非篡改值", new_task["data_fingerprint"] != "tampered_resub_fp")
+
+    process_pending_tasks()
+    final = get_export_task(new_task["id"])
+    assert_eq("新任务导出成功", final["status"], TASK_STATUS_SUCCESS)
+
+    old_task = get_export_task(task["id"])
+    assert_eq("旧任务仍为待确认", old_task["status"], TASK_STATUS_PENDING_CONFIRMATION)
+
+
+def test_pending_confirmation_redownload_blocked_then_ok_after_confirm():
+    print("\n=== 假一致回归: pending_confirmation不可下载，确认后可下载 ===")
+    users = get_all_users()
+    sup = [u for u in users if u["role"] == "supervisor"][0]
+
+    snap = ExportTaskSnapshot(
+        filters={"keyword": _ukw()},
+        columns=["part_code", "part_name", "available_stock"],
+        export_format=FORMAT_CSV,
+    )
+    task = submit_export_task(sup["id"], TASK_TYPE_STOCK, snap)
+
+    with get_connection() as conn:
+        conn.execute("UPDATE export_tasks SET data_fingerprint = 'tampered_dl_fp' WHERE id = ?",
+                     (task["id"],))
+
+    process_pending_tasks()
+
+    after_block = get_export_task(task["id"])
+    assert_eq("被拦截为待确认", after_block["status"], TASK_STATUS_PENDING_CONFIRMATION)
+
+    avail = check_download_availability(task["id"])
+    assert_false("待确认状态不可下载", avail["available"])
+
+    confirm_pending_task(task["id"], sup["id"])
+    process_pending_tasks()
+
+    final = get_export_task(task["id"])
+    assert_eq("确认后导出成功", final["status"], TASK_STATUS_SUCCESS)
+
+    avail2 = check_download_availability(task["id"])
+    assert_true("确认导出后可下载", avail2["available"])
+    assert_eq("下载返回导出条数", avail2.get("export_count"), final["export_count"])
+
+
+def test_recover_incomplete_only_running_not_success():
+    print("\n=== 假一致回归: recover_incomplete_tasks只回收running不伤success ===")
+    users = get_all_users()
+    sup = [u for u in users if u["role"] == "supervisor"][0]
+
+    snap_success = ExportTaskSnapshot(
+        filters={"keyword": _ukw()},
+        columns=["part_code", "part_name", "available_stock"],
+        export_format=FORMAT_CSV,
+    )
+    t_success = submit_export_task(sup["id"], TASK_TYPE_STOCK, snap_success)
+    process_pending_tasks()
+
+    done = get_export_task(t_success["id"])
+    assert_eq("先导出成功", done["status"], TASK_STATUS_SUCCESS)
+    file_path_success = done["export_file_path"]
+    assert_true("成功任务文件存在", os.path.exists(file_path_success))
+
+    snap_running = ExportTaskSnapshot(
+        filters={"keyword": _ukw()},
+        export_format=FORMAT_CSV,
+    )
+    t_running = submit_export_task(sup["id"], TASK_TYPE_BORROW, snap_running)
+    with get_connection() as conn:
+        conn.execute("UPDATE export_tasks SET status = 'running', started_at = ? WHERE id = ?",
+                     ("2025-01-01T00:00:00", t_running["id"]))
+
+    recover_incomplete_tasks()
+
+    running_after = get_export_task(t_running["id"])
+    assert_eq("running任务被回收为failed", running_after["status"], TASK_STATUS_FAILED)
+
+    success_after = get_export_task(t_success["id"])
+    assert_eq("success任务不受影响", success_after["status"], TASK_STATUS_SUCCESS)
+    assert_eq("success文件路径不变", success_after["export_file_path"], file_path_success)
+    assert_true("success文件仍存在", os.path.exists(file_path_success))
+
+    avail = check_download_availability(t_success["id"])
+    assert_true("success任务仍可下载", avail["available"])
+    assert_eq("下载条数不变", avail.get("export_count"), done["export_count"])
+
+
+def test_recover_incomplete_preserves_success_with_file():
+    print("\n=== 假一致回归: recover不删成功任务的文件，不影响导出条数 ===")
+    users = get_all_users()
+    op = [u for u in users if u["role"] == "operator"][0]
+
+    snap = ExportTaskSnapshot(
+        filters={"keyword": _ukw()},
+        columns=["part_code", "part_name", "available_stock"],
+        export_format=FORMAT_XLSX,
+    )
+    t = submit_export_task(op["id"], TASK_TYPE_STOCK, snap)
+    process_pending_tasks()
+
+    done = get_export_task(t["id"])
+    assert_eq("先导出成功", done["status"], TASK_STATUS_SUCCESS)
+    original_count = done["export_count"]
+    original_file = done["export_file_path"]
+    original_fp = done["data_fingerprint"]
+
+    snap2 = ExportTaskSnapshot(
+        filters={"keyword": _ukw()},
+        export_format=FORMAT_CSV,
+    )
+    t2 = submit_export_task(op["id"], TASK_TYPE_BORROW, snap2)
+    with get_connection() as conn:
+        conn.execute("UPDATE export_tasks SET status = 'running', started_at = ? WHERE id = ?",
+                     ("2025-01-03T00:00:00", t2["id"]))
+
+    recover_incomplete_tasks()
+
+    success_task = get_export_task(t["id"])
+    assert_eq("成功任务状态不变", success_task["status"], TASK_STATUS_SUCCESS)
+    assert_eq("成功任务文件路径不变", success_task["export_file_path"], original_file)
+    assert_eq("成功任务导出条数不变", success_task["export_count"], original_count)
+    assert_eq("成功任务指纹不变", success_task["data_fingerprint"], original_fp)
+    assert_true("成功任务文件实际存在", os.path.exists(original_file))
+
+    result = verify_export_task_consistency(t["id"])
+    assert_true("成功任务一致性仍通过", result["consistent"])
+
+
 if __name__ == "__main__":
     try:
         init_db()
@@ -900,6 +1343,21 @@ if __name__ == "__main__":
         test_cleanup_expired_preserves_valid()
         test_logged_errors_in_operation_logs()
         test_xlsx_consistency_verify_with_columns()
+
+        test_stock_name_change_detected_after_submit()
+        test_stock_quantity_change_detected_after_submit()
+        test_borrow_new_record_after_submit_changes_fingerprint()
+
+        test_export_csv_content_asserts_real_field_values()
+        test_export_xlsx_content_asserts_real_field_values()
+
+        test_pending_confirmation_confirm_updates_fingerprint_and_export()
+        test_pending_confirmation_retry_updates_fingerprint_and_export()
+        test_pending_confirmation_resubmit_creates_new_task()
+        test_pending_confirmation_redownload_blocked_then_ok_after_confirm()
+
+        test_recover_incomplete_only_running_not_success()
+        test_recover_incomplete_preserves_success_with_file()
 
         print(f"\n{'='*60}")
         print(f"深度回归测试完成: {passed} 通过, {failed} 失败")

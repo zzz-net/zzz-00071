@@ -149,8 +149,13 @@ def _generate_batch_no():
 def _compute_data_fingerprint(records):
     if not records:
         return hashlib.md5(b"empty").hexdigest()
-    id_str = ",".join(str(r.get("id", r.get("record_no", ""))) for r in records)
-    return hashlib.md5(id_str.encode("utf-8")).hexdigest()
+    content_parts = []
+    for r in records:
+        key = r.get("id", r.get("record_no", ""))
+        val_str = json.dumps(r, sort_keys=True, ensure_ascii=False, default=str)
+        content_parts.append(f"{key}:{val_str}")
+    full_str = "|".join(content_parts)
+    return hashlib.md5(full_str.encode("utf-8")).hexdigest()
 
 
 def _check_disk_space(export_dir, estimated_bytes=0):

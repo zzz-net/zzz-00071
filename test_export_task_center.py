@@ -30,7 +30,7 @@ from export_task_center import (
     _get_export_dir, _check_disk_space, _check_write_permission,
     TASK_TYPE_BORROW, TASK_TYPE_STOCK, TASK_TYPE_STOCK_LOG,
     TASK_STATUS_PENDING, TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS,
-    TASK_STATUS_FAILED, TASK_STATUS_CANCELLED,
+    TASK_STATUS_FAILED, TASK_STATUS_CANCELLED, TASK_STATUS_PENDING_CONFIRMATION,
     EXPORT_TASK_DISPLAY, TASK_TYPE_DISPLAY,
 )
 
@@ -698,7 +698,7 @@ def test_query_records_for_task():
 
 
 def test_data_changed_on_export():
-    print("\n=== 导出任务测试36: 导出时源数据变化导致失败 ===")
+    print("\n=== 导出任务测试36: 导出时源数据变化进入待确认 ===")
     users = get_all_users()
     supervisor = [u for u in users if u["role"] == "supervisor"][0]
 
@@ -714,7 +714,7 @@ def test_data_changed_on_export():
     process_pending_tasks()
 
     updated = get_export_task(task["id"])
-    assert_eq("数据变化时导出失败", updated["status"], TASK_STATUS_FAILED)
+    assert_eq("数据变化时进入待确认", updated["status"], TASK_STATUS_PENDING_CONFIRMATION)
     assert_true("错误信息包含变化提示",
                 updated.get("error_message") is not None and "变化" in updated["error_message"])
 
