@@ -19,7 +19,10 @@ from scheme_coordinator import (
     restore_workbench_state, save_last_filters, get_last_filters,
     log_query_operation, log_export_operation, verify_export_consistency,
     activate_scheme, deactivate_scheme, delete_scheme_and_cleanup,
-    get_available_schemes, _can_access_scheme, RestoreResult
+    get_available_schemes, _can_access_scheme, RestoreResult,
+    rename_scheme, get_recycle_bin, restore_scheme_from_recycle,
+    handle_user_switch, get_last_login_user_id, save_workbench_full_state,
+    load_workbench_full_state, WorkbenchState, handle_corrupt_state
 )
 
 
@@ -462,7 +465,9 @@ class MainApp(tk.Tk):
         self.wb_scheme_combo.bind("<<ComboboxSelected>>", self._on_wb_scheme_selected)
         ttk.Button(row2, text="激活方案", command=self._wb_activate_scheme, width=10).pack(side="left", padx=3)
         ttk.Button(row2, text="保存当前条件为方案", command=self._wb_save_scheme, width=16).pack(side="left", padx=3)
+        ttk.Button(row2, text="重命名", command=self._wb_rename_scheme, width=8).pack(side="left", padx=3)
         ttk.Button(row2, text="删除方案", command=self._wb_delete_scheme, width=10).pack(side="left", padx=3)
+        ttk.Button(row2, text="回收站", command=self._wb_show_recycle_bin, width=8).pack(side="left", padx=3)
 
         filter_frame = ttk.LabelFrame(tab, text="筛选条件（恢复状态后可直接修改并重查）", padding=8)
         filter_frame.pack(fill="x", pady=(0, 8))
@@ -834,6 +839,11 @@ class MainApp(tk.Tk):
             self.destroy()
 
     def _refresh_init_with_restore(self):
+        prev_user_id = get_last_login_user_id()
+        is_user_switched = (prev_user_id is not None and prev_user_id != self.current_user["id"])
+        if is_user_switched:
+            handle_user_switch(prev_user_id, self.current_user["id"])
+
         categories = get_all_categories()
         self.parts_category_combo.configure(values=[""] + categories)
         self.parts_category_combo.current(0)
@@ -848,7 +858,13 @@ class MainApp(tk.Tk):
         self._refresh_borrower_combo()
         self._wb_refresh_borrower_combo()
 
-        restore_result = restore_workbench_state(self.current_user["id"], self.current_user["role"])
+        self._wb_refresh_scheme_combo()
+        self._refresh_scheme_combo()
+
+        try:
+            restore_result = restore_workbench_state(self.current_user["id"], self.current_user["role"])
+        except Exception as e:
+            restore_result = handle_corrupt_state(self.current_user["id"])
 
         self._apply_restored_state_to_workbench(restore_result)
         self._apply_restored_state_to_borrow_tab(restore_result)
@@ -864,12 +880,10 @@ class MainApp(tk.Tk):
         if restore_result.warnings:
             hint = " | ".join(restore_result.warnings)
             self.restore_hint_label.configure(text=f"恢复提示: {hint}")
-            if len(restore_result.warnings) == 1 and "方案" in restore_result.warnings[0]:
-                pass
-            else:
-                pass
         else:
             self.restore_hint_label.configure(text="")
+
+        self._wb_save_full_state()
 
     def _update_button_permissions(self):
         is_supervisor = self.current_user and self.current_user["role"] == "supervisor"
@@ -1064,8 +1078,10 @@ class MainApp(tk.Tk):
         self.wb_count_label.configure(text=f"{len(records)} 条")
         if self.current_user and log_query:
             log_query_operation(self.current_user["id"], filters, len(records))
-        if not _is_filter_empty(filters) and self.current_user:
-            save_last_filters(self.current_user["id"], filters)
+        if self.current_user:
+            if not _is_filter_empty(filters):
+                save_last_filters(self.current_user["id"], filters)
+            self._wb_save_full_state()
 
     def _wb_reset_filters(self):
         self.wb_status_combo.current(0)
@@ -1172,6 +1188,103 @@ class MainApp(tk.Tk):
             self._refresh_borrow()
         except BusinessException as e:
             messagebox.showerror("删除失败", e.message, parent=self)
+
+    def _wb_rename_scheme(self):
+        label = self.wb_scheme_var.get()
+        scheme_id = self._wb_scheme_map.get(label)
+        if not scheme_id:
+            messagebox.showinfo("提示", "请先从下拉列表选择一个方案", parent=self)
+            return
+        scheme = get_filter_scheme_by_id(scheme_id)
+        if not scheme:
+            messagebox.showwarning("提示", "方案已不存在", parent=self)
+            self._wb_refresh_scheme_combo()
+            return
+        from tkinter import simpledialog
+        new_name = simpledialog.askstring(
+            "重命名方案", f"请输入新的方案名称：",
+            initialvalue=scheme["name"], parent=self
+        )
+        if not new_name or not new_name.strip():
+            return
+        try:
+            updated = rename_scheme(scheme_id, new_name.strip(),
+                                    self.current_user["id"], self.current_user["role"])
+            self._wb_refresh_scheme_combo()
+            self._refresh_scheme_combo()
+            if get_active_scheme_id(self.current_user["id"]) == scheme_id:
+                self.wb_active_scheme_label.configure(
+                    text=updated["name"], foreground="#409EFF")
+                self.active_scheme_label.configure(text=f"当前方案: {updated['name']}")
+            for lbl, sid in self._wb_scheme_map.items():
+                if sid == scheme_id:
+                    self.wb_scheme_var.set(lbl)
+                    break
+            messagebox.showinfo("成功", f"方案已重命名为「{updated['name']}」", parent=self)
+        except BusinessException as e:
+            messagebox.showerror("重命名失败", e.message, parent=self)
+
+    def _wb_show_recycle_bin(self):
+        recycle_items = get_recycle_bin(self.current_user["id"])
+        if not recycle_items:
+            messagebox.showinfo("回收站", "回收站为空", parent=self)
+            return
+        dlg = tk.Toplevel(self)
+        dlg.title("方案回收站")
+        dlg.geometry("520x380")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        frame = ttk.Frame(dlg, padding=10)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="最近删除的方案（7天内可恢复）：",
+                  font=("Microsoft YaHei", 10, "bold")).pack(anchor="w", pady=(0, 8))
+        columns = ("name", "scope", "deleted_at")
+        tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
+        tree.heading("name", text="方案名称")
+        tree.heading("scope", text="可见范围")
+        tree.heading("deleted_at", text="删除时间")
+        tree.column("name", width=180, anchor="w")
+        tree.column("scope", width=100, anchor="center")
+        tree.column("deleted_at", width=180, anchor="center")
+        for item in recycle_items:
+            scope_text = "共享" if item.scope == "shared" else "个人"
+            tree.insert("", "end", iid=item.name, values=(item.name, scope_text, item.deleted_at))
+        tree.pack(fill="both", expand=True, pady=(0, 10))
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill="x")
+        def _on_restore():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showinfo("提示", "请选择要恢复的方案", parent=dlg)
+                return
+            scheme_name = sel[0]
+            try:
+                restored = restore_scheme_from_recycle(
+                    self.current_user["id"], scheme_name, self.current_user["role"])
+                self._wb_refresh_scheme_combo()
+                self._refresh_scheme_combo()
+                tree.delete(scheme_name)
+                messagebox.showinfo("成功", f"方案「{scheme_name}」已恢复", parent=dlg)
+                if not tree.get_children():
+                    dlg.destroy()
+            except BusinessException as e:
+                messagebox.showerror("恢复失败", e.message, parent=dlg)
+        ttk.Button(btn_frame, text="恢复选中方案", command=_on_restore, width=14).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="关闭", command=dlg.destroy, width=10).pack(side="right", padx=5)
+
+    def _wb_save_full_state(self):
+        if not self.current_user:
+            return
+        state = WorkbenchState()
+        state.filters = self._collect_wb_filters()
+        active_id = get_active_scheme_id(self.current_user["id"])
+        if active_id:
+            scheme = get_filter_scheme_by_id(active_id)
+            if scheme:
+                state.active_scheme_id = scheme["id"]
+                state.active_scheme_name = scheme["name"]
+        save_workbench_full_state(self.current_user["id"], state)
 
     def _wb_check_active_scheme_valid(self):
         active_id = get_active_scheme_id(self.current_user["id"])
