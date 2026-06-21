@@ -32,6 +32,7 @@ TASK_STATUS_RUNNING = "running"
 TASK_STATUS_SUCCESS = "success"
 TASK_STATUS_FAILED = "failed"
 TASK_STATUS_CANCELLED = "cancelled"
+TASK_STATUS_PENDING_CONFIRMATION = "pending_confirmation"
 
 TASK_TYPE_BORROW = "borrow_records"
 TASK_TYPE_STOCK = "stock_details"
@@ -43,6 +44,7 @@ EXPORT_TASK_DISPLAY = {
     TASK_STATUS_SUCCESS: ("已完成", "#67C23A"),
     TASK_STATUS_FAILED: ("失败", "#F56C6C"),
     TASK_STATUS_CANCELLED: ("已取消", "#909399"),
+    TASK_STATUS_PENDING_CONFIRMATION: ("待确认", "#E6A23C"),
 }
 
 TASK_TYPE_DISPLAY = {
@@ -137,6 +139,11 @@ def _get_export_dir():
 def _generate_task_no():
     now = datetime.now()
     return f"ET{now.strftime('%Y%m%d%H%M%S')}{now.microsecond // 1000:03d}"
+
+
+def _generate_batch_no():
+    now = datetime.now()
+    return f"EB{now.strftime('%Y%m%d%H%M%S')}{now.microsecond // 1000:03d}"
 
 
 def _compute_data_fingerprint(records):
@@ -235,10 +242,10 @@ class ConflictInfo:
         }
 
 
-def check_conflict(user_id, task_type, filters_snapshot):
+def check_conflict(user_id, task_type, filters_snapshot, columns_snapshot=None, export_format=None):
     with get_connection() as conn:
         rows = conn.execute("""
-            SELECT id, task_no, status, created_at, filters_snapshot
+            SELECT id, task_no, status, created_at, filters_snapshot, columns_snapshot, export_format
             FROM export_tasks
             WHERE user_id = ? AND task_type = ? AND status IN ('pending', 'running')
             ORDER BY created_at DESC
@@ -247,36 +254,53 @@ def check_conflict(user_id, task_type, filters_snapshot):
         if not rows:
             return None
 
-        snapshot_dict = filters_snapshot if isinstance(filters_snapshot, dict) else json.loads(filters_snapshot)
+        snapshot_dict = filters_snapshot if isinstance(filters_snapshot, dict) else json.loads(filters_snapshot) if filters_snapshot else {}
         snapshot_key = json.dumps(snapshot_dict, sort_keys=True, ensure_ascii=False)
+        cols_set = set(columns_snapshot) if columns_snapshot else None
+        fmt_to_check = export_format
 
         for row in rows:
             row_dict = dict(row)
             try:
-                existing = json.loads(row_dict["filters_snapshot"]) if row_dict["filters_snapshot"] else {}
-                existing_key = json.dumps(existing, sort_keys=True, ensure_ascii=False)
-                if existing_key == snapshot_key:
-                    status_text = EXPORT_TASK_DISPLAY.get(row_dict["status"], (row_dict["status"], ""))[0]
-                    return ConflictInfo(
-                        conflict_task_id=row_dict["id"],
-                        conflict_task_no=row_dict["task_no"],
-                        conflict_status=row_dict["status"],
-                        conflict_created_at=row_dict["created_at"],
-                        message=f"存在相同条件的{status_text}任务 {row_dict['task_no']}（提交于 {row_dict['created_at']}），请先处理冲突"
-                    )
+                existing_filters = json.loads(row_dict["filters_snapshot"]) if row_dict["filters_snapshot"] else {}
+                existing_key = json.dumps(existing_filters, sort_keys=True, ensure_ascii=False)
+                if existing_key != snapshot_key:
+                    continue
+
+                existing_cols = json.loads(row_dict["columns_snapshot"]) if row_dict.get("columns_snapshot") else []
+                if cols_set is not None and set(existing_cols) != cols_set:
+                    continue
+
+                existing_fmt = row_dict.get("export_format", FORMAT_CSV)
+                if fmt_to_check is not None and existing_fmt != fmt_to_check:
+                    continue
+
+                status_text = EXPORT_TASK_DISPLAY.get(row_dict["status"], (row_dict["status"], ""))[0]
+                return ConflictInfo(
+                    conflict_task_id=row_dict["id"],
+                    conflict_task_no=row_dict["task_no"],
+                    conflict_status=row_dict["status"],
+                    conflict_created_at=row_dict["created_at"],
+                    message=f"存在相同条件+列配置+格式的{status_text}任务 {row_dict['task_no']}（提交于 {row_dict['created_at']}），请先处理冲突"
+                )
             except (json.JSONDecodeError, TypeError):
                 continue
 
         return None
 
 
-def submit_export_task(user_id, task_type, snapshot, force=False):
+def submit_export_task(user_id, task_type, snapshot, force=False, formats=None):
     if not snapshot or not isinstance(snapshot, ExportTaskSnapshot):
         raise BusinessException("任务快照不能为空")
 
-    fmt = snapshot.export_format
-    if fmt not in EXPORT_FORMATS:
-        raise BusinessException(f"不支持的导出格式: {fmt}")
+    primary_fmt = snapshot.export_format
+    if primary_fmt not in EXPORT_FORMATS:
+        raise BusinessException(f"不支持的导出格式: {primary_fmt}")
+
+    fmt_list = formats if formats else [primary_fmt]
+    for f in fmt_list:
+        if f not in EXPORT_FORMATS:
+            raise BusinessException(f"不支持的导出格式: {f}")
 
     filters_json = json.dumps(snapshot.filters, ensure_ascii=False)
     sort_json = json.dumps({"sort_by": snapshot.sort_by, "sort_order": snapshot.sort_order},
@@ -288,10 +312,6 @@ def submit_export_task(user_id, task_type, snapshot, force=False):
     }, ensure_ascii=False) if snapshot.page is not None else ""
     columns_json = json.dumps(snapshot.columns, ensure_ascii=False) if snapshot.columns else ""
 
-    conflict = check_conflict(user_id, task_type, filters_json)
-    if conflict and not force:
-        raise BusinessException(conflict.message)
-
     records = _query_records_for_task(task_type, snapshot.filters)
     record_count = len(records)
     data_fingerprint = _compute_data_fingerprint(records)
@@ -301,44 +321,63 @@ def submit_export_task(user_id, task_type, snapshot, force=False):
     if not ok:
         raise BusinessException(err)
 
-    est_bytes = record_count * 500
-    if fmt == FORMAT_XLSX:
-        est_bytes = int(est_bytes * 1.3)
+    est_bytes = record_count * 500 * len(fmt_list)
     ok, err = _check_disk_space(export_dir, est_bytes)
     if not ok:
         raise BusinessException(err)
 
     now = datetime.now().isoformat()
     expires_at = (datetime.now() + timedelta(days=FILE_EXPIRE_DAYS)).isoformat()
-    task_no = _generate_task_no()
-
-    conflict_task_id = conflict.conflict_task_id if conflict else None
+    batch_no = _generate_batch_no()
+    frozen_data_json = json.dumps(records, ensure_ascii=False, default=str)
 
     with get_connection() as conn:
-        cursor = conn.execute("""
-            INSERT INTO export_tasks (
-                task_no, user_id, task_type, status, export_format,
-                filters_snapshot, sort_snapshot, page_snapshot, columns_snapshot,
-                record_count, data_fingerprint, conflict_task_id,
-                created_at, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        conn.execute("""
+            INSERT INTO export_batch_snapshots (
+                batch_no, user_id, task_type, filters_snapshot, sort_snapshot,
+                page_snapshot, columns_snapshot, data_fingerprint, record_count,
+                frozen_data_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            task_no, user_id, task_type, TASK_STATUS_PENDING, fmt,
-            filters_json, sort_json, page_json, columns_json,
-            record_count, data_fingerprint, conflict_task_id,
-            now, expires_at
+            batch_no, user_id, task_type, filters_json, sort_json,
+            page_json, columns_json, data_fingerprint, record_count,
+            frozen_data_json, now
         ))
-        task_id = cursor.lastrowid
 
-        if conflict and conflict.conflict_task_id:
-            conn.execute("""
-                UPDATE export_tasks SET status = ?, completed_at = ? WHERE id = ? AND status IN ('pending', 'running')
-            """, (TASK_STATUS_CANCELLED, now, conflict.conflict_task_id))
+        created_tasks = []
+        for fmt in fmt_list:
+            conflict = check_conflict(user_id, task_type, filters_json, snapshot.columns, fmt)
+            if conflict and not force:
+                raise BusinessException(conflict.message)
 
-        _log_task_operation(conn, user_id, "submit_export_task", task_id,
-                            f"提交导出任务 {task_no}, 类型={TASK_TYPE_DISPLAY.get(task_type, task_type)}, 格式={FORMAT_DISPLAY.get(fmt, fmt)}, 预计{record_count}条")
+            task_no = _generate_task_no()
+            conflict_task_id = conflict.conflict_task_id if conflict else None
 
-    return get_export_task(task_id)
+            cursor = conn.execute("""
+                INSERT INTO export_tasks (
+                    task_no, batch_no, user_id, task_type, status, export_format,
+                    filters_snapshot, sort_snapshot, page_snapshot, columns_snapshot,
+                    record_count, data_fingerprint, conflict_task_id,
+                    created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                task_no, batch_no, user_id, task_type, TASK_STATUS_PENDING, fmt,
+                filters_json, sort_json, page_json, columns_json,
+                record_count, data_fingerprint, conflict_task_id,
+                now, expires_at
+            ))
+            task_id = cursor.lastrowid
+
+            if conflict and conflict.conflict_task_id:
+                conn.execute("""
+                    UPDATE export_tasks SET status = ?, completed_at = ? WHERE id = ? AND status IN ('pending', 'running')
+                """, (TASK_STATUS_CANCELLED, now, conflict.conflict_task_id))
+
+            _log_task_operation(conn, user_id, "submit_export_task", task_id,
+                                f"提交导出任务 {task_no}, 批次={batch_no}, 类型={TASK_TYPE_DISPLAY.get(task_type, task_type)}, 格式={FORMAT_DISPLAY.get(fmt, fmt)}, 预计{record_count}条")
+            created_tasks.append(task_id)
+
+    return get_export_task(created_tasks[0])
 
 
 def _query_records_for_task(task_type, filters):
@@ -615,8 +654,8 @@ def _execute_export(task_id):
         current_fingerprint = _compute_data_fingerprint(current_records)
 
         if current_fingerprint != (task["data_fingerprint"] or ""):
-            _mark_task_failed(task_id, task["user_id"],
-                              f"源数据已变化（提交时 {task['record_count']} 条，当前 {len(current_records)} 条），请重新提交任务")
+            _mark_task_pending_confirmation(task_id, task["user_id"],
+                              f"源数据已变化（提交时 {task['record_count']} 条，当前 {len(current_records)} 条），请确认后继续或重新提交")
             return
 
         sort_by = None
@@ -719,6 +758,16 @@ def _mark_task_failed(task_id, user_id, error_message):
                             f"导出失败: {error_message}", success=False, error_message=error_message)
 
 
+def _mark_task_pending_confirmation(task_id, user_id, message):
+    now = datetime.now().isoformat()
+    with get_connection() as conn:
+        conn.execute("""
+            UPDATE export_tasks SET status = ?, error_message = ? WHERE id = ?
+        """, (TASK_STATUS_PENDING_CONFIRMATION, message, task_id))
+        _log_task_operation(conn, user_id, "export_task_data_changed", task_id,
+                            f"数据变化拦截: {message}", success=False, error_message=message)
+
+
 def get_export_task(task_id):
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM export_tasks WHERE id = ?", (task_id,)).fetchone()
@@ -778,6 +827,56 @@ def get_task_operation_logs(task_id, limit=100):
         return [dict(row) for row in rows]
 
 
+def get_batch_snapshot(batch_no):
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM export_batch_snapshots WHERE batch_no = ?", (batch_no,)).fetchone()
+        return dict(row) if row else None
+
+def get_batch_tasks(batch_no):
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT et.*, u.display_name AS user_name
+            FROM export_tasks et
+            JOIN users u ON et.user_id = u.id
+            WHERE et.batch_no = ?
+            ORDER BY et.export_format ASC, et.created_at ASC
+        """, (batch_no,)).fetchall()
+        return [dict(row) for row in rows]
+
+def get_user_batches(user_id, limit=50):
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT ebs.*,
+                (SELECT COUNT(*) FROM export_tasks WHERE batch_no = ebs.batch_no) AS task_count,
+                (SELECT COUNT(*) FROM export_tasks WHERE batch_no = ebs.batch_no AND status = 'success') AS success_count,
+                (SELECT COUNT(*) FROM export_tasks WHERE batch_no = ebs.batch_no AND status IN ('pending', 'running')) AS active_count,
+                (SELECT COUNT(*) FROM export_tasks WHERE batch_no = ebs.batch_no AND status = 'failed') AS failed_count,
+                (SELECT COUNT(*) FROM export_tasks WHERE batch_no = ebs.batch_no AND status = 'pending_confirmation') AS confirm_count
+            FROM export_batch_snapshots ebs
+            WHERE ebs.user_id = ?
+            ORDER BY ebs.created_at DESC
+            LIMIT ?
+        """, (user_id, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+def get_batch_aggregate_status(batch_no):
+    tasks = get_batch_tasks(batch_no)
+    if not tasks:
+        return "empty"
+    statuses = {t["status"] for t in tasks}
+    if statuses == {TASK_STATUS_SUCCESS}:
+        return TASK_STATUS_SUCCESS
+    if statuses <= {TASK_STATUS_CANCELLED}:
+        return TASK_STATUS_CANCELLED
+    if TASK_STATUS_PENDING_CONFIRMATION in statuses:
+        return TASK_STATUS_PENDING_CONFIRMATION
+    if TASK_STATUS_FAILED in statuses and not statuses.intersection({TASK_STATUS_PENDING, TASK_STATUS_RUNNING}):
+        return TASK_STATUS_FAILED
+    if statuses.intersection({TASK_STATUS_PENDING, TASK_STATUS_RUNNING}):
+        return TASK_STATUS_RUNNING
+    return "mixed"
+
+
 def cancel_export_task(task_id, user_id):
     task = get_export_task(task_id)
     if not task:
@@ -804,8 +903,8 @@ def retry_export_task(task_id, user_id):
         raise BusinessException("任务不存在")
     if task["user_id"] != user_id:
         raise BusinessException("只能重试自己提交的任务")
-    if task["status"] != TASK_STATUS_FAILED:
-        raise BusinessException("只有失败的任务可以重试")
+    if task["status"] not in (TASK_STATUS_FAILED, TASK_STATUS_PENDING_CONFIRMATION):
+        raise BusinessException("只有失败或待确认的任务可以重试")
 
     filters = _deserialize_filters(task["filters_snapshot"])
     records = _query_records_for_task(task["task_type"], filters)
@@ -825,6 +924,36 @@ def retry_export_task(task_id, user_id):
         """, (TASK_STATUS_PENDING, record_count, new_fingerprint, new_expires, task_id))
         _log_task_operation(conn, user_id, "retry_export_task", task_id,
                             f"重试导出任务 {task['task_no']}")
+
+    return get_export_task(task_id)
+
+
+def confirm_pending_task(task_id, user_id):
+    task = get_export_task(task_id)
+    if not task:
+        raise BusinessException("任务不存在")
+    if task["user_id"] != user_id:
+        raise BusinessException("只能确认自己提交的任务")
+    if task["status"] != TASK_STATUS_PENDING_CONFIRMATION:
+        raise BusinessException("只有待确认的任务可以确认继续")
+
+    filters = _deserialize_filters(task["filters_snapshot"])
+    records = _query_records_for_task(task["task_type"], filters)
+    record_count = len(records)
+    new_fingerprint = _compute_data_fingerprint(records)
+
+    now = datetime.now().isoformat()
+    new_expires = (datetime.now() + timedelta(days=FILE_EXPIRE_DAYS)).isoformat()
+
+    with get_connection() as conn:
+        conn.execute("""
+            UPDATE export_tasks SET status = ?, record_count = ?, data_fingerprint = ?,
+                error_message = NULL, export_file_path = NULL, export_count = 0,
+                started_at = NULL, completed_at = NULL, expires_at = ?
+            WHERE id = ?
+        """, (TASK_STATUS_PENDING, record_count, new_fingerprint, new_expires, task_id))
+        _log_task_operation(conn, user_id, "confirm_pending_task", task_id,
+                            f"确认继续导出任务 {task['task_no']}，更新指纹后重新排队")
 
     return get_export_task(task_id)
 
@@ -1053,6 +1182,14 @@ def recover_incomplete_tasks():
             """, (TASK_STATUS_FAILED, "程序重启，任务中断，请重试", now, row["id"]))
             _log_task_operation(conn, row["user_id"], "recover_incomplete_task", row["id"],
                                 f"程序重启恢复: 任务 {row['task_no']} 标记为失败")
+
+        pending_confirm = conn.execute("""
+            SELECT id, user_id, task_no FROM export_tasks WHERE status = 'pending_confirmation'
+        """).fetchall()
+
+        for row in pending_confirm:
+            _log_task_operation(conn, row["user_id"], "recover_pending_confirmation", row["id"],
+                                f"程序重启恢复: 任务 {row['task_no']} 保持待确认状态")
 
 
 def start_export_worker():

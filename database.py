@@ -142,12 +142,31 @@ def init_db():
         """)
 
         cursor.execute("""
+            CREATE TABLE IF NOT EXISTS export_batch_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_no TEXT UNIQUE NOT NULL,
+                user_id INTEGER NOT NULL,
+                task_type TEXT NOT NULL,
+                filters_snapshot TEXT NOT NULL,
+                sort_snapshot TEXT,
+                page_snapshot TEXT,
+                columns_snapshot TEXT,
+                data_fingerprint TEXT,
+                record_count INTEGER DEFAULT 0,
+                frozen_data_json TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS export_tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 task_no TEXT UNIQUE NOT NULL,
+                batch_no TEXT,
                 user_id INTEGER NOT NULL,
                 task_type TEXT NOT NULL DEFAULT 'borrow_records',
-                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'success', 'failed', 'cancelled')),
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'success', 'failed', 'cancelled', 'pending_confirmation')),
                 filters_snapshot TEXT NOT NULL,
                 sort_snapshot TEXT,
                 page_snapshot TEXT,
@@ -162,7 +181,8 @@ def init_db():
                 started_at TEXT,
                 completed_at TEXT,
                 expires_at TEXT,
-                FOREIGN KEY (user_id) REFERENCES users(id)
+                FOREIGN KEY (user_id) REFERENCES users(id),
+                FOREIGN KEY (batch_no) REFERENCES export_batch_snapshots(batch_no)
             )
         """)
 
@@ -175,11 +195,69 @@ def init_db():
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_export_tasks_type ON export_tasks(task_type)
         """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_export_tasks_batch ON export_tasks(batch_no)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_export_batch_user ON export_batch_snapshots(user_id)
+        """)
 
         try:
             cursor.execute("ALTER TABLE export_tasks ADD COLUMN export_format TEXT NOT NULL DEFAULT 'csv'")
         except sqlite3.OperationalError:
             pass
+
+        try:
+            cursor.execute("ALTER TABLE export_tasks ADD COLUMN batch_no TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            conn.execute("SELECT status FROM export_tasks WHERE status = 'pending_confirmation' LIMIT 1")
+        except sqlite3.IntegrityError:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS export_tasks_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_no TEXT UNIQUE NOT NULL,
+                    batch_no TEXT,
+                    user_id INTEGER NOT NULL,
+                    task_type TEXT NOT NULL DEFAULT 'borrow_records',
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'success', 'failed', 'cancelled', 'pending_confirmation')),
+                    filters_snapshot TEXT NOT NULL,
+                    sort_snapshot TEXT,
+                    page_snapshot TEXT,
+                    columns_snapshot TEXT,
+                    record_count INTEGER DEFAULT 0,
+                    export_file_path TEXT,
+                    export_count INTEGER DEFAULT 0,
+                    error_message TEXT,
+                    conflict_task_id INTEGER,
+                    data_fingerprint TEXT,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    expires_at TEXT,
+                    FOREIGN KEY (user_id) REFERENCES users(id),
+                    FOREIGN KEY (batch_no) REFERENCES export_batch_snapshots(batch_no)
+                )
+            """)
+            cols = [row[1] for row in cursor.execute("PRAGMA table_info(export_tasks)").fetchall()]
+            col_list = ", ".join(cols)
+            cursor.execute(f"INSERT INTO export_tasks_new ({col_list}) SELECT {col_list} FROM export_tasks")
+            cursor.execute("DROP TABLE export_tasks")
+            cursor.execute("ALTER TABLE export_tasks_new RENAME TO export_tasks")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_export_tasks_user ON export_tasks(user_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_export_tasks_status ON export_tasks(status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_export_tasks_type ON export_tasks(task_type)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_export_tasks_batch ON export_tasks(batch_no)")
+            try:
+                cursor.execute("ALTER TABLE export_tasks ADD COLUMN export_format TEXT NOT NULL DEFAULT 'csv'")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cursor.execute("ALTER TABLE export_tasks ADD COLUMN batch_no TEXT")
+            except sqlite3.OperationalError:
+                pass
 
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_filter_scheme_owner ON filter_schemes(owner_id)

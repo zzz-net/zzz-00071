@@ -29,7 +29,7 @@ from export_task_center import (
     _get_export_dir, _check_disk_space, _check_write_permission,
     TASK_TYPE_BORROW, TASK_TYPE_STOCK, TASK_TYPE_STOCK_LOG,
     TASK_STATUS_PENDING, TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS,
-    TASK_STATUS_FAILED, TASK_STATUS_CANCELLED,
+    TASK_STATUS_FAILED, TASK_STATUS_CANCELLED, TASK_STATUS_PENDING_CONFIRMATION,
     EXPORT_TASK_DISPLAY, TASK_TYPE_DISPLAY, ConflictInfo,
     cleanup_expired_files, resubmit_as_new, get_task_operation_logs,
     FORMAT_CSV, FORMAT_XLSX, EXPORT_FORMATS,
@@ -541,7 +541,7 @@ def test_cleanup_expired_preserves_valid():
 
 
 def test_logged_errors_in_operation_logs():
-    print("\n=== 深度回归: 导出失败写入操作日志 ===")
+    print("\n=== 深度回归: 数据变化拦截写入操作日志（进入待确认） ===")
     users = get_all_users()
     sup = [u for u in users if u["role"] == "supervisor"][0]
 
@@ -553,18 +553,18 @@ def test_logged_errors_in_operation_logs():
                      (task["id"],))
 
     before_logs = get_operation_logs(limit=500)
-    before_fail = len([l for l in before_logs if l["action"] == "export_task_failed" and not l["success"]])
+    before_change = len([l for l in before_logs if l["action"] == "export_task_data_changed" and not l["success"]])
 
     process_pending_tasks()
 
     after_logs = get_operation_logs(limit=500)
-    after_fail = len([l for l in after_logs if l["action"] == "export_task_failed" and not l["success"]])
+    after_change = len([l for l in after_logs if l["action"] == "export_task_data_changed" and not l["success"]])
 
-    assert_true("导出失败有操作日志", after_fail > before_fail)
+    assert_true("数据变化拦截有操作日志", after_change > before_change)
 
-    failed_task = get_export_task(task["id"])
-    assert_eq("任务状态为失败", failed_task["status"], TASK_STATUS_FAILED)
-    assert_true("失败有错误信息", len(failed_task.get("error_message") or "") > 0)
+    changed_task = get_export_task(task["id"])
+    assert_eq("任务状态为待确认", changed_task["status"], TASK_STATUS_PENDING_CONFIRMATION)
+    assert_true("有错误信息", len(changed_task.get("error_message") or "") > 0)
 
 
 def _count_xlsx_rows(xlsx_path):
@@ -773,7 +773,7 @@ def test_cross_restart_running_xlsx_then_retry_and_resubmit():
 
 
 def test_conflict_same_filters_different_format_still_conflicts():
-    print("\n=== 新增回归: 同条件不同格式仍判定冲突 ===")
+    print("\n=== 新增回归: 同条件不同格式不冲突（允许同批次CSV+XLSX并存） ===")
     users = get_all_users()
     op = [u for u in users if u["role"] == "operator"][0]
 
@@ -782,16 +782,12 @@ def test_conflict_same_filters_different_format_still_conflicts():
     t_csv = submit_export_task(op["id"], TASK_TYPE_BORROW, snap_csv)
 
     snap_xlsx = ExportTaskSnapshot(filters=filters, export_format=FORMAT_XLSX)
-    conflict = check_conflict(op["id"], TASK_TYPE_BORROW, snap_xlsx.filters)
-    assert_true("CSV未完成，XLSX同条件仍冲突", conflict is not None)
-    assert_eq("冲突任务ID匹配", conflict.conflict_task_id, t_csv["id"])
+    conflict = check_conflict(op["id"], TASK_TYPE_BORROW, snap_xlsx.filters, snap_xlsx.columns, FORMAT_XLSX)
+    assert_true("同条件不同格式不冲突", conflict is None)
 
-    try:
-        submit_export_task(op["id"], TASK_TYPE_BORROW, snap_xlsx)
-        assert_false("提交应抛出 BusinessException", True)
-    except BusinessException as e:
-        assert_true("消息含'相同条件'", "相同条件" in e.message)
-        assert_true("消息含任务编号", t_csv["task_no"] in e.message)
+    t_xlsx = submit_export_task(op["id"], TASK_TYPE_BORROW, snap_xlsx)
+    assert_true("不同格式可分别提交", t_xlsx is not None)
+    assert_true("两个任务ID不同", t_csv["id"] != t_xlsx["id"])
 
 
 def test_permission_write_simulated_failure_and_recovery():
