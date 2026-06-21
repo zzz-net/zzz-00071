@@ -142,6 +142,41 @@ def init_db():
         """)
 
         cursor.execute("""
+            CREATE TABLE IF NOT EXISTS export_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_no TEXT UNIQUE NOT NULL,
+                user_id INTEGER NOT NULL,
+                task_type TEXT NOT NULL DEFAULT 'borrow_records',
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'success', 'failed', 'cancelled')),
+                filters_snapshot TEXT NOT NULL,
+                sort_snapshot TEXT,
+                page_snapshot TEXT,
+                columns_snapshot TEXT,
+                record_count INTEGER DEFAULT 0,
+                export_file_path TEXT,
+                export_count INTEGER DEFAULT 0,
+                error_message TEXT,
+                conflict_task_id INTEGER,
+                data_fingerprint TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                expires_at TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_export_tasks_user ON export_tasks(user_id)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_export_tasks_status ON export_tasks(status)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_export_tasks_type ON export_tasks(task_type)
+        """)
+
+        cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_filter_scheme_owner ON filter_schemes(owner_id)
         """)
 
