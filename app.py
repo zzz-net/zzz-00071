@@ -6,7 +6,7 @@ from services import (
     get_all_users, get_user_by_username, get_all_parts, get_all_categories,
     get_part_by_id, create_part, update_part, adjust_stock, delete_part,
     submit_borrow, approve_borrow, reject_borrow, return_part, rollback_borrow,
-    cancel_borrow, get_borrow_records, get_borrow_record, get_stock_logs,
+    cancel_borrow, undo_return, get_borrow_records, get_borrow_record, get_stock_logs,
     get_operation_logs, STATUS_DISPLAY, OPERATION_DISPLAY, BusinessException
 )
 from exporter import (
@@ -450,6 +450,8 @@ class MainApp(tk.Tk):
         btn_frame.pack(fill="x", pady=(0, 8))
         self.btn_return = ttk.Button(btn_frame, text="归还", command=self._return_part, width=10)
         self.btn_return.pack(side="left", padx=3)
+        self.btn_undo_return = ttk.Button(btn_frame, text="撤销归还", command=self._undo_return_record, width=10)
+        self.btn_undo_return.pack(side="left", padx=3)
         self.btn_rollback = ttk.Button(btn_frame, text="异常回滚", command=self._rollback_record, width=10)
         self.btn_rollback.pack(side="left", padx=3)
         self.btn_cancel = ttk.Button(btn_frame, text="撤销申请", command=self._cancel_record, width=10)
@@ -841,6 +843,25 @@ class MainApp(tk.Tk):
                 self._refresh_all()
             except BusinessException as e:
                 messagebox.showerror("失败", e.message, parent=self)
+
+    def _undo_return_record(self):
+        record = self._get_selected_borrow()
+        if not record:
+            return
+        if record["status"] != "returned":
+            messagebox.showwarning("提示", "只有已归还的记录可以撤销归还", parent=self)
+            return
+        if not messagebox.askyesno("确认撤销归还",
+                                   f"确定要撤销记录 {record['record_no']} 的归还？\n"
+                                   f"这将扣除 {record['return_quantity']}{record['unit']} 对应库存，记录恢复为已借出状态。",
+                                   parent=self):
+            return
+        try:
+            undo_return(record["id"], self.current_user["id"], "界面撤销归还")
+            messagebox.showinfo("成功", "归还已撤销，库存已回扣，记录恢复为已借出", parent=self)
+            self._refresh_all()
+        except BusinessException as e:
+            messagebox.showerror("失败", e.message, parent=self)
 
     def _rollback_record(self):
         record = self._get_selected_borrow()
