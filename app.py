@@ -443,7 +443,7 @@ class MainApp(tk.Tk):
         info_frame = ttk.LabelFrame(tab, text="工作台说明", padding=8)
         info_frame.pack(fill="x", pady=(0, 8))
         ttk.Label(info_frame, text="本工作台整合了条件恢复、方案管理、结果重查和导出校验的完整链路。\n"
-                                   "登录或重启程序后，将自动按上次生效条件和选中方案直接查询列表。",
+                                   "登录或重启程序后，将自动按上次生效条件、排序、分页和选中方案直接查询列表。",
                   wraplength=1000, foreground="#606266").pack(anchor="w")
 
         scheme_frame = ttk.LabelFrame(tab, text="方案管理", padding=8)
@@ -509,7 +509,7 @@ class MainApp(tk.Tk):
         ttk.Button(frow2, text="查询", command=self._wb_refresh_records, width=8).pack(side="left", padx=10)
         ttk.Button(frow2, text="重置条件", command=self._wb_reset_filters, width=10).pack(side="left", padx=2)
 
-        result_frame = ttk.LabelFrame(tab, text="查询结果", padding=8)
+        result_frame = ttk.LabelFrame(tab, text="查询结果（点击列头可排序，底部可翻页）", padding=8)
         result_frame.pack(fill="both", expand=True, pady=(0, 8))
 
         btn_row = ttk.Frame(result_frame)
@@ -517,6 +517,9 @@ class MainApp(tk.Tk):
         ttk.Label(btn_row, text="记录计数:").pack(side="left")
         self.wb_count_label = ttk.Label(btn_row, text="0 条", foreground="#409EFF", font=("Microsoft YaHei", 9, "bold"))
         self.wb_count_label.pack(side="left", padx=5)
+        ttk.Label(btn_row, text="| 排序:").pack(side="left", padx=10)
+        self.wb_sort_label = ttk.Label(btn_row, text="创建时间↓", foreground="#909399")
+        self.wb_sort_label.pack(side="left", padx=3)
         ttk.Separator(btn_row, orient="vertical").pack(side="left", fill="y", padx=10)
         ttk.Button(btn_row, text="导出CSV", command=self._wb_export_csv, width=12).pack(side="left", padx=3)
         ttk.Button(btn_row, text="校验导出一致性", command=self._wb_verify_export, width=16).pack(side="left", padx=3)
@@ -526,6 +529,26 @@ class MainApp(tk.Tk):
         wb_columns = ("record_no", "part_code", "part_name", "quantity", "unit", "borrower",
                       "status", "created_at")
         self.wb_tree = ttk.Treeview(result_frame, columns=wb_columns, show="headings", selectmode="browse")
+        self._wb_col_sort_map = {
+            "record_no": "record_no",
+            "part_code": "part_code",
+            "part_name": "part_name",
+            "quantity": "quantity",
+            "unit": "unit",
+            "borrower": "borrower_name",
+            "status": "status",
+            "created_at": "created_at",
+        }
+        self._wb_col_text_map = {
+            "record_no": "记录编号",
+            "part_code": "备件编码",
+            "part_name": "备件名称",
+            "quantity": "数量",
+            "unit": "单位",
+            "borrower": "借用人",
+            "status": "状态",
+            "created_at": "创建时间",
+        }
         wb_headers = [
             ("record_no", "记录编号", 140),
             ("part_code", "备件编码", 85),
@@ -537,7 +560,8 @@ class MainApp(tk.Tk):
             ("created_at", "创建时间", 140),
         ]
         for col, text, width in wb_headers:
-            self.wb_tree.heading(col, text=text)
+            self.wb_tree.heading(col, text=text,
+                                 command=lambda c=col: self._wb_on_column_click(c))
             self.wb_tree.column(col, width=width, anchor="center")
         self.wb_tree.tag_configure("pending_approval", background="#FDF6EC")
         self.wb_tree.tag_configure("approved", background="#ECF5FF")
@@ -550,6 +574,50 @@ class MainApp(tk.Tk):
         self.wb_tree.configure(yscrollcommand=wb_vsb.set)
         self.wb_tree.pack(side="left", fill="both", expand=True)
         wb_vsb.pack(side="right", fill="y")
+
+        pager_frame = ttk.Frame(result_frame)
+        pager_frame.pack(fill="x", pady=(5, 0))
+        ttk.Label(pager_frame, text="每页数量:").pack(side="left")
+        self.wb_page_size_var = tk.IntVar(value=20)
+        self.wb_page_size_combo = ttk.Combobox(
+            pager_frame, textvariable=self.wb_page_size_var, state="readonly", width=6,
+            values=[10, 20, 50, 100, 200, 500]
+        )
+        self.wb_page_size_combo.pack(side="left", padx=3)
+        self.wb_page_size_combo.bind("<<ComboboxSelected>>", lambda e: self._wb_on_page_size_change())
+        ttk.Separator(pager_frame, orient="vertical").pack(side="left", fill="y", padx=8)
+        self.wb_btn_first = ttk.Button(pager_frame, text="首页", width=6,
+                                        command=lambda: self._wb_goto_page(1))
+        self.wb_btn_first.pack(side="left", padx=1)
+        self.wb_btn_prev = ttk.Button(pager_frame, text="上一页", width=6,
+                                       command=lambda: self._wb_goto_page(self.wb_current_page - 1))
+        self.wb_btn_prev.pack(side="left", padx=1)
+        ttk.Label(pager_frame, text="第").pack(side="left", padx=(5, 0))
+        self.wb_page_var = tk.IntVar(value=1)
+        self.wb_page_spinbox = ttk.Spinbox(
+            pager_frame, from_=1, to=1, textvariable=self.wb_page_var, width=5,
+            command=self._wb_on_page_spin_change
+        )
+        self.wb_page_spinbox.pack(side="left", padx=2)
+        self.wb_page_spinbox.bind("<Return>", lambda e: self._wb_on_page_spin_change())
+        self.wb_total_pages_label = ttk.Label(pager_frame, text="页 / 共 1 页")
+        self.wb_total_pages_label.pack(side="left", padx=2)
+        self.wb_btn_next = ttk.Button(pager_frame, text="下一页", width=6,
+                                       command=lambda: self._wb_goto_page(self.wb_current_page + 1))
+        self.wb_btn_next.pack(side="left", padx=1)
+        self.wb_btn_last = ttk.Button(pager_frame, text="末页", width=6,
+                                       command=lambda: self._wb_goto_page(self.wb_total_pages))
+        self.wb_btn_last.pack(side="left", padx=1)
+        ttk.Separator(pager_frame, orient="vertical").pack(side="left", fill="y", padx=8)
+        self.wb_pager_info = ttk.Label(pager_frame, text="", foreground="#909399")
+        self.wb_pager_info.pack(side="left", padx=5)
+
+        self._wb_current_page = 1
+        self._wb_total_pages = 1
+        self._wb_total_count = 0
+        self._wb_all_records = []
+        self.wb_sort_by = "created_at"
+        self.wb_sort_order = "desc"
 
         self._wb_last_export_path = None
         self._wb_last_export_filters = None
@@ -1019,6 +1087,32 @@ class MainApp(tk.Tk):
         date_to_val = filters.get("date_to", "")
         self.wb_date_to.set(date_to_val)
 
+        state = restore_result.state
+        if state:
+            valid_page_sizes = [10, 20, 50, 100, 200, 500]
+            page_size = state.page_size or 20
+            if page_size not in valid_page_sizes:
+                page_size = 20
+            self.wb_page_size_var.set(page_size)
+
+            valid_sort_fields = list(self._wb_col_sort_map.values())
+            sort_by = state.sort_by or "created_at"
+            if sort_by not in valid_sort_fields:
+                sort_by = "created_at"
+            self.wb_sort_by = sort_by
+            sort_order = state.sort_order or "desc"
+            if sort_order not in ("asc", "desc"):
+                sort_order = "desc"
+            self.wb_sort_order = sort_order
+            self._wb_update_sort_label()
+
+            total_pages_before = self._wb_total_pages
+            page = state.page or 1
+            if page < 1:
+                page = 1
+            self._wb_current_page = page
+            self.wb_page_var.set(page)
+
     def _apply_restored_state_to_borrow_tab(self, restore_result):
         if not self.current_user:
             return
@@ -1063,24 +1157,132 @@ class MainApp(tk.Tk):
         date_to_val = filters.get("date_to", "")
         self.date_to_var.set(date_to_val)
 
-    def _wb_refresh_records(self, log_query=True):
-        filters = self._collect_wb_filters()
-        records = get_borrow_records(**filters)
+    def _wb_update_sort_label(self):
+        arrow = "↑" if self.wb_sort_order == "asc" else "↓"
+        field_text = "创建时间"
+        for ui_col, db_col in self._wb_col_sort_map.items():
+            if db_col == self.wb_sort_by:
+                field_text = self._wb_col_text_map.get(ui_col, db_col)
+                break
+        self.wb_sort_label.configure(text=f"{field_text}{arrow}")
+
+    def _wb_on_column_click(self, col):
+        db_field = self._wb_col_sort_map.get(col)
+        if not db_field:
+            return
+        if self.wb_sort_by == db_field:
+            self.wb_sort_order = "asc" if self.wb_sort_order == "desc" else "desc"
+        else:
+            self.wb_sort_by = db_field
+            self.wb_sort_order = "desc"
+        self._wb_update_sort_label()
+        self._wb_current_page = 1
+        self.wb_page_var.set(1)
+        self._wb_refresh_records()
+
+    def _wb_on_page_size_change(self):
+        self._wb_current_page = 1
+        self.wb_page_var.set(1)
+        self._wb_refresh_records()
+
+    def _wb_on_page_spin_change(self):
+        try:
+            new_page = int(self.wb_page_var.get())
+        except (ValueError, tk.TclError):
+            new_page = 1
+        self._wb_goto_page(new_page, update_spinbox=False)
+
+    def _wb_goto_page(self, page, update_spinbox=True):
+        if self._wb_total_pages <= 0:
+            self._wb_current_page = 1
+            if update_spinbox:
+                self.wb_page_var.set(1)
+            return
+        if page < 1:
+            page = 1
+        if page > self._wb_total_pages:
+            page = self._wb_total_pages
+        if page == self._wb_current_page and len(self.wb_tree.get_children()) > 0:
+            return
+        self._wb_current_page = page
+        if update_spinbox:
+            self.wb_page_var.set(page)
+        self._wb_render_paged_records()
+
+    def _wb_render_paged_records(self):
         for item in self.wb_tree.get_children():
             self.wb_tree.delete(item)
-        for r in records:
+        page_size = self.wb_page_size_var.get()
+        start = (self._wb_current_page - 1) * page_size
+        end = start + page_size
+        page_records = self._wb_all_records[start:end]
+        for r in page_records:
             status_text, _ = STATUS_DISPLAY.get(r["status"], (r["status"], ""))
             self.wb_tree.insert("", "end", iid=str(r["id"]), values=(
                 r["record_no"], r["part_code"], r["part_name"],
                 r["quantity"], r["unit"], r["borrower_name"],
                 status_text, r["created_at"]
             ), tags=(r["status"],))
-        self.wb_count_label.configure(text=f"{len(records)} 条")
+        self._wb_update_pager_buttons()
+
+    def _wb_update_pager_buttons(self):
+        if self._wb_total_pages <= 1:
+            self._wb_total_pages = 1
+        self.wb_page_spinbox.configure(to=self._wb_total_pages)
+        self.wb_total_pages_label.configure(text=f"页 / 共 {self._wb_total_pages} 页")
+        if self._wb_current_page <= 1:
+            self.wb_btn_first.configure(state="disabled")
+            self.wb_btn_prev.configure(state="disabled")
+        else:
+            self.wb_btn_first.configure(state="normal")
+            self.wb_btn_prev.configure(state="normal")
+        if self._wb_current_page >= self._wb_total_pages:
+            self.wb_btn_next.configure(state="disabled")
+            self.wb_btn_last.configure(state="disabled")
+        else:
+            self.wb_btn_next.configure(state="normal")
+            self.wb_btn_last.configure(state="normal")
+        page_size = self.wb_page_size_var.get()
+        if self._wb_total_count == 0:
+            self.wb_pager_info.configure(text="(0 条记录)")
+        else:
+            start_idx = (self._wb_current_page - 1) * page_size + 1
+            end_idx = min(self._wb_current_page * page_size, self._wb_total_count)
+            self.wb_pager_info.configure(text=f"(显示 {start_idx}-{end_idx} / 共 {self._wb_total_count} 条)")
+
+    def _wb_refresh_records(self, log_query=True):
+        filters = self._collect_wb_filters()
+        all_records = get_borrow_records(**filters)
+
+        sort_key = self.wb_sort_by
+        reverse = (self.wb_sort_order == "desc")
+        try:
+            all_records.sort(key=lambda r: (r.get(sort_key) is None, r.get(sort_key, "")),
+                             reverse=reverse)
+        except Exception:
+            pass
+
+        self._wb_all_records = all_records
+        self._wb_total_count = len(all_records)
+        page_size = self.wb_page_size_var.get()
+        self._wb_total_pages = max(1, (self._wb_total_count + page_size - 1) // page_size)
+        if self._wb_current_page > self._wb_total_pages:
+            self._wb_current_page = self._wb_total_pages
+            self.wb_page_var.set(self._wb_current_page)
+
+        self._wb_render_paged_records()
+        self.wb_count_label.configure(text=f"{self._wb_total_count} 条")
+        self._wb_update_pager_buttons()
         if self.current_user and log_query:
-            log_query_operation(self.current_user["id"], filters, len(records))
+            log_query_operation(self.current_user["id"], filters, self._wb_total_count)
         if self.current_user:
             if not _is_filter_empty(filters):
                 save_last_filters(self.current_user["id"], filters)
+            save_last_list_state(self.current_user["id"],
+                                 sort_by=self.wb_sort_by,
+                                 sort_order=self.wb_sort_order,
+                                 page=self._wb_current_page,
+                                 page_size=page_size)
             self._wb_save_full_state()
 
     def _wb_reset_filters(self):
@@ -1089,6 +1291,12 @@ class MainApp(tk.Tk):
         self.wb_borrower_combo.current(0)
         self.wb_date_from.set("")
         self.wb_date_to.set("")
+        self.wb_sort_by = "created_at"
+        self.wb_sort_order = "desc"
+        self._wb_update_sort_label()
+        self.wb_page_size_var.set(20)
+        self._wb_current_page = 1
+        self.wb_page_var.set(1)
         deactivate_scheme(self.current_user["id"])
         self.wb_active_scheme_label.configure(text="未激活", foreground="#909399")
         self.wb_scheme_combo.set("")
@@ -1097,6 +1305,8 @@ class MainApp(tk.Tk):
         self.scheme_combo.set("")
         if self.current_user:
             save_last_filters(self.current_user["id"], {})
+            save_last_list_state(self.current_user["id"], sort_by="created_at",
+                                 sort_order="desc", page=1, page_size=20)
         self._wb_refresh_records()
         self._refresh_borrow()
 
@@ -1278,6 +1488,10 @@ class MainApp(tk.Tk):
             return
         state = WorkbenchState()
         state.filters = self._collect_wb_filters()
+        state.sort_by = self.wb_sort_by
+        state.sort_order = self.wb_sort_order
+        state.page = self._wb_current_page
+        state.page_size = self.wb_page_size_var.get()
         active_id = get_active_scheme_id(self.current_user["id"])
         if active_id:
             scheme = get_filter_scheme_by_id(active_id)

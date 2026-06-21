@@ -391,7 +391,7 @@ class PermissionGuard:
 class RestoreCoordinator:
     """
     恢复协调层 - 按优先级逐级尝试恢复
-    优先级: 激活方案 > 完整工作台状态 > 上次筛选条件 > 默认状态
+    优先级: 完整工作台状态(含激活方案) > 激活方案 + 列表状态 > 上次筛选条件 > 默认状态
     每一层失败都有对应的回退和警告
     """
 
@@ -402,8 +402,8 @@ class RestoreCoordinator:
         返回 RestoreResult，包含恢复的状态和回退信息
         
         fallback_level 说明:
-        - none: 从激活方案恢复（最高优先级，无回退）
-        - full_state: 从完整工作台状态恢复（回退1级）
+        - none: 从完整工作台状态恢复（最高优先级，含激活方案+分页+排序）
+        - full_state: 从完整工作台状态恢复，但激活方案已不可用
         - last_filters: 从上次筛选条件恢复（回退2级）
         - default: 使用默认状态（回退3级）
         - corrupt: 配置损坏，强制重置
@@ -414,22 +414,28 @@ class RestoreCoordinator:
 
         StatePersistence.clear_expired_recycle_items(user_id)
 
-        # 第1层: 尝试从激活方案恢复
-        scheme_restored = RestoreCoordinator._try_restore_from_active_scheme(user_id, role, result)
-        if scheme_restored:
-            result.success = True
-            result.fallback_level = "none"
-            _log_operation(user_id, "restore_filter_state", "workbench", None,
-                           f"工作台状态恢复: 激活方案「{result.scheme.get('name')}」，级别=none")
-            return result
-
-        # 第2层: 尝试从完整工作台状态恢复
+        # 第1层: 尝试从完整工作台状态恢复（包含激活方案+筛选+排序+分页）
         state_restored = RestoreCoordinator._try_restore_from_full_state(user_id, role, result)
         if state_restored:
             result.success = True
+            if result.scheme:
+                result.fallback_level = "none"
+                _log_operation(user_id, "restore_filter_state", "workbench", None,
+                               f"工作台状态恢复: 完整状态（方案: {result.scheme.get('name')}），级别=none")
+            else:
+                result.fallback_level = "full_state"
+                _log_operation(user_id, "restore_filter_state", "workbench", None,
+                               f"工作台状态恢复: 完整状态（无可用方案），级别=full_state，原因={result.fallback_reason}")
+            return result
+
+        # 第2层: 尝试从激活方案 + 独立列表状态恢复
+        scheme_restored = RestoreCoordinator._try_restore_from_active_scheme(user_id, role, result)
+        if scheme_restored:
+            result.success = True
             result.fallback_level = "full_state"
+            result.warnings.append("已从激活方案恢复（完整工作台状态不存在，使用独立列表状态）")
             _log_operation(user_id, "restore_filter_state", "workbench", None,
-                           f"工作台状态恢复: 完整状态，级别=full_state，原因={result.fallback_reason or '无激活方案'}")
+                           f"工作台状态恢复: 激活方案「{result.scheme.get('name')}」+ 独立列表状态，级别=full_state")
             return result
 
         # 第3层: 尝试从上次筛选条件恢复
@@ -524,10 +530,14 @@ class RestoreCoordinator:
                     result.warnings.append("完整状态中的方案不可用，仅恢复筛选和列表状态")
                     state.active_scheme_id = None
                     state.active_scheme_name = None
+                    _clear_active_scheme_safe(user_id)
+                    result.fallback_reason = "完整状态中的方案已删除或无权限"
             except Exception as e:
                 result.warnings.append(f"校验完整状态中的方案失败: {e}")
                 state.active_scheme_id = None
                 state.active_scheme_name = None
+                _clear_active_scheme_safe(user_id)
+                result.fallback_reason = f"校验方案异常: {e}"
 
         if state.filters and not _is_filter_empty(state.filters):
             result.state = state

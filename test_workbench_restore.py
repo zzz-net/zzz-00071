@@ -162,7 +162,7 @@ def test_workbench_state_corrupt_handling():
 # ============================================================
 
 def test_four_level_restore_priority():
-    """测试4: 四层恢复优先级（激活方案 > 完整状态 > 上次筛选 > 默认）"""
+    """测试4: 四层恢复优先级（完整状态+激活方案 > 激活方案+列表状态 > 上次筛选 > 默认）"""
     print("\n=== 回归测试4: 四层恢复优先级验证 ===")
     users = get_all_users()
     supervisor = [u for u in users if u["role"] == "supervisor"][0]
@@ -171,14 +171,21 @@ def test_four_level_restore_priority():
 
     save_last_filters(supervisor["id"], {"status": "returned", "keyword": "level3"})
 
-    state = WorkbenchState()
-    state.filters = {"status": "approved", "keyword": "level2"}
-    state.page = 5
-    save_workbench_full_state(supervisor["id"], state)
-
     sid = save_filter_scheme("优先级测试方案", supervisor["id"],
                              {"status": "pending_approval", "keyword": "level1"},
                              scope="personal", role="supervisor")
+
+    # 真实场景：用户使用该方案查询后，工作台完整状态包含方案ID+筛选+分页+排序
+    state = WorkbenchState()
+    state.active_scheme_id = sid
+    state.active_scheme_name = "优先级测试方案"
+    state.filters = {"status": "pending_approval", "keyword": "level1"}
+    state.page = 5
+    state.page_size = 50
+    state.sort_by = "part_code"
+    state.sort_order = "asc"
+    save_workbench_full_state(supervisor["id"], state)
+
     set_active_scheme_id(supervisor["id"], sid)
 
     result = restore_workbench_state(supervisor["id"], supervisor["role"])
@@ -186,6 +193,9 @@ def test_four_level_restore_priority():
     assert_true("优先从激活方案恢复", result.scheme is not None)
     assert_eq("使用方案的filters", result.filters.get("keyword"), "level1")
     assert_eq("回退级别为 none", result.fallback_level, "none")
+    assert_eq("完整状态中的page保留", result.state.page, 5)
+    assert_eq("完整状态中的page_size保留", result.state.page_size, 50)
+    assert_eq("完整状态中的sort_by保留", result.state.sort_by, "part_code")
 
 
 def test_restore_fallback_level_scheme_deleted():
@@ -926,6 +936,16 @@ def test_restore_operation_logged():
     sid = save_filter_scheme("日志恢复测试", supervisor["id"],
                             {"keyword": "log_restore"},
                             scope="personal", role="supervisor")
+    
+    # 保存完整工作台状态（含激活方案关联），恢复时走full_state+激活方案路径
+    clear_all_user_state(supervisor["id"])
+    state = WorkbenchState()
+    state.active_scheme_id = sid
+    state.active_scheme_name = "日志恢复测试"
+    state.filters = {"keyword": "log_restore"}
+    state.page = 2
+    state.page_size = 30
+    save_workbench_full_state(supervisor["id"], state)
     set_active_scheme_id(supervisor["id"], sid)
 
     before_count = len([l for l in get_operation_logs(limit=500)

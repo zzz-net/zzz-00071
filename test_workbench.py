@@ -27,7 +27,7 @@ from scheme_coordinator import (
     activate_scheme, deactivate_scheme, delete_scheme_and_cleanup,
     get_available_schemes, set_active_scheme_id, get_active_scheme_id,
     save_last_list_state, get_last_list_state, clear_all_user_state,
-    RestoreResult
+    RestoreResult, WorkbenchState, save_workbench_full_state
 )
 
 passed = 0
@@ -308,6 +308,16 @@ def test_restore_operation_log():
     sid = save_filter_scheme("恢复日志方案", supervisor["id"],
                              {"keyword": "restore_log"},
                              scope="personal", role="supervisor")
+    
+    # 保存完整工作台状态（含激活方案关联），恢复时走full_state路径
+    clear_all_user_state(supervisor["id"])
+    state = WorkbenchState()
+    state.active_scheme_id = sid
+    state.active_scheme_name = "恢复日志方案"
+    state.filters = {"keyword": "restore_log"}
+    state.page = 2
+    state.page_size = 30
+    save_workbench_full_state(supervisor["id"], state)
     set_active_scheme_id(supervisor["id"], sid)
 
     restore_workbench_state(supervisor["id"], supervisor["role"])
