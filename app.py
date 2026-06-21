@@ -9,11 +9,17 @@ from services import (
     cancel_borrow, undo_return, get_borrow_records, get_borrow_record, get_stock_logs,
     get_operation_logs, STATUS_DISPLAY, OPERATION_DISPLAY, BusinessException,
     save_filter_scheme, get_filter_schemes, delete_filter_scheme, get_filter_scheme_by_id,
-    set_active_scheme_id, get_active_scheme_id
+    set_active_scheme_id, get_active_scheme_id, _is_filter_empty
 )
 from exporter import (
     export_stock_details, export_borrow_records, export_stock_logs,
     generate_default_filename
+)
+from scheme_coordinator import (
+    restore_workbench_state, save_last_filters, get_last_filters,
+    log_query_operation, log_export_operation, verify_export_consistency,
+    activate_scheme, deactivate_scheme, delete_scheme_and_cleanup,
+    get_available_schemes, _can_access_scheme, RestoreResult
 )
 
 
@@ -413,6 +419,7 @@ class MainApp(tk.Tk):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=(0, 5))
 
+        self._build_workbench_tab()
         self._build_parts_tab()
         self._build_borrow_tab()
         self._build_approval_tab()
@@ -423,6 +430,124 @@ class MainApp(tk.Tk):
         self.status.pack(fill="x")
         self.status_label = ttk.Label(self.status, text="就绪", style="Status.TLabel")
         self.status_label.pack(side="left")
+        self.restore_hint_label = ttk.Label(self.status, text="", style="Status.TLabel", foreground="#E6A23C")
+        self.restore_hint_label.pack(side="right")
+
+    def _build_workbench_tab(self):
+        tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(tab, text="恢复工作台")
+
+        info_frame = ttk.LabelFrame(tab, text="工作台说明", padding=8)
+        info_frame.pack(fill="x", pady=(0, 8))
+        ttk.Label(info_frame, text="本工作台整合了条件恢复、方案管理、结果重查和导出校验的完整链路。\n"
+                                   "登录或重启程序后，将自动按上次生效条件和选中方案直接查询列表。",
+                  wraplength=1000, foreground="#606266").pack(anchor="w")
+
+        scheme_frame = ttk.LabelFrame(tab, text="方案管理", padding=8)
+        scheme_frame.pack(fill="x", pady=(0, 8))
+
+        row1 = ttk.Frame(scheme_frame)
+        row1.pack(fill="x", pady=3)
+        ttk.Label(row1, text="当前方案:", width=10).pack(side="left")
+        self.wb_active_scheme_label = ttk.Label(row1, text="未激活", foreground="#909399")
+        self.wb_active_scheme_label.pack(side="left", padx=5)
+
+        row2 = ttk.Frame(scheme_frame)
+        row2.pack(fill="x", pady=3)
+        ttk.Label(row2, text="选择方案:", width=10).pack(side="left")
+        self.wb_scheme_var = tk.StringVar()
+        self.wb_scheme_combo = ttk.Combobox(row2, textvariable=self.wb_scheme_var,
+                                            state="readonly", width=35)
+        self.wb_scheme_combo.pack(side="left", padx=5)
+        self.wb_scheme_combo.bind("<<ComboboxSelected>>", self._on_wb_scheme_selected)
+        ttk.Button(row2, text="激活方案", command=self._wb_activate_scheme, width=10).pack(side="left", padx=3)
+        ttk.Button(row2, text="保存当前条件为方案", command=self._wb_save_scheme, width=16).pack(side="left", padx=3)
+        ttk.Button(row2, text="删除方案", command=self._wb_delete_scheme, width=10).pack(side="left", padx=3)
+
+        filter_frame = ttk.LabelFrame(tab, text="筛选条件（恢复状态后可直接修改并重查）", padding=8)
+        filter_frame.pack(fill="x", pady=(0, 8))
+
+        frow1 = ttk.Frame(filter_frame)
+        frow1.pack(fill="x", pady=3)
+        ttk.Label(frow1, text="状态:").pack(side="left")
+        self.wb_status = tk.StringVar()
+        wb_statuses = [("全部", ""), ("待审批", "pending_approval"), ("已借出", "approved"),
+                       ("已借出(部分归还)", "borrowed"), ("已归还", "returned"), ("已驳回", "rejected"),
+                       ("已回滚", "rollback"), ("已撤销", "cancelled")]
+        self.wb_status_combo = ttk.Combobox(
+            frow1, textvariable=self.wb_status, state="readonly", width=16,
+            values=[s[0] for s in wb_statuses]
+        )
+        self.wb_status_combo.current(0)
+        self.wb_status_combo.pack(side="left", padx=5)
+        self._wb_status_map = {s[0]: s[1] for s in wb_statuses}
+        ttk.Label(frow1, text="借用人:").pack(side="left", padx=(10, 0))
+        self.wb_borrower = tk.StringVar()
+        self.wb_borrower_combo = ttk.Combobox(frow1, textvariable=self.wb_borrower,
+                                               state="readonly", width=14)
+        self.wb_borrower_combo.pack(side="left", padx=5)
+        self._wb_borrower_map = {}
+        ttk.Label(frow1, text="关键字:").pack(side="left", padx=(10, 0))
+        self.wb_keyword = tk.StringVar()
+        ttk.Entry(frow1, textvariable=self.wb_keyword, width=22).pack(side="left", padx=5)
+
+        frow2 = ttk.Frame(filter_frame)
+        frow2.pack(fill="x", pady=3)
+        ttk.Label(frow2, text="开始日期:").pack(side="left")
+        self.wb_date_from = tk.StringVar()
+        ttk.Entry(frow2, textvariable=self.wb_date_from, width=14).pack(side="left", padx=5)
+        ttk.Label(frow2, text="(如 2025-01-01)", foreground="#909399").pack(side="left")
+        ttk.Label(frow2, text="结束日期:").pack(side="left", padx=(15, 0))
+        self.wb_date_to = tk.StringVar()
+        ttk.Entry(frow2, textvariable=self.wb_date_to, width=14).pack(side="left", padx=5)
+        ttk.Label(frow2, text="(如 2025-12-31)", foreground="#909399").pack(side="left")
+        ttk.Button(frow2, text="查询", command=self._wb_refresh_records, width=8).pack(side="left", padx=10)
+        ttk.Button(frow2, text="重置条件", command=self._wb_reset_filters, width=10).pack(side="left", padx=2)
+
+        result_frame = ttk.LabelFrame(tab, text="查询结果", padding=8)
+        result_frame.pack(fill="both", expand=True, pady=(0, 8))
+
+        btn_row = ttk.Frame(result_frame)
+        btn_row.pack(fill="x", pady=(0, 5))
+        ttk.Label(btn_row, text="记录计数:").pack(side="left")
+        self.wb_count_label = ttk.Label(btn_row, text="0 条", foreground="#409EFF", font=("Microsoft YaHei", 9, "bold"))
+        self.wb_count_label.pack(side="left", padx=5)
+        ttk.Separator(btn_row, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Button(btn_row, text="导出CSV", command=self._wb_export_csv, width=12).pack(side="left", padx=3)
+        ttk.Button(btn_row, text="校验导出一致性", command=self._wb_verify_export, width=16).pack(side="left", padx=3)
+        self.wb_verify_result_label = ttk.Label(btn_row, text="", foreground="#67C23A")
+        self.wb_verify_result_label.pack(side="left", padx=10)
+
+        wb_columns = ("record_no", "part_code", "part_name", "quantity", "unit", "borrower",
+                      "status", "created_at")
+        self.wb_tree = ttk.Treeview(result_frame, columns=wb_columns, show="headings", selectmode="browse")
+        wb_headers = [
+            ("record_no", "记录编号", 140),
+            ("part_code", "备件编码", 85),
+            ("part_name", "备件名称", 130),
+            ("quantity", "数量", 55),
+            ("unit", "单位", 45),
+            ("borrower", "借用人", 75),
+            ("status", "状态", 75),
+            ("created_at", "创建时间", 140),
+        ]
+        for col, text, width in wb_headers:
+            self.wb_tree.heading(col, text=text)
+            self.wb_tree.column(col, width=width, anchor="center")
+        self.wb_tree.tag_configure("pending_approval", background="#FDF6EC")
+        self.wb_tree.tag_configure("approved", background="#ECF5FF")
+        self.wb_tree.tag_configure("rejected", background="#FEF0F0")
+        self.wb_tree.tag_configure("returned", background="#F0F9EB")
+        self.wb_tree.tag_configure("rollback", background="#F4F4F5")
+        self.wb_tree.tag_configure("cancelled", background="#F4F4F5")
+        self.wb_tree.tag_configure("borrowed", background="#ECF5FF")
+        wb_vsb = ttk.Scrollbar(result_frame, orient="vertical", command=self.wb_tree.yview)
+        self.wb_tree.configure(yscrollcommand=wb_vsb.set)
+        self.wb_tree.pack(side="left", fill="both", expand=True)
+        wb_vsb.pack(side="right", fill="y")
+
+        self._wb_last_export_path = None
+        self._wb_last_export_filters = None
 
     def _build_parts_tab(self):
         tab = ttk.Frame(self.notebook, padding=10)
@@ -704,10 +829,47 @@ class MainApp(tk.Tk):
             self.user_info.configure(text=f"当前用户: {self.current_user['display_name']} ({role_text})")
             self.deiconify()
             self._update_button_permissions()
-            self._refresh_all()
-            self._restore_active_scheme()
+            self._refresh_init_with_restore()
         else:
             self.destroy()
+
+    def _refresh_init_with_restore(self):
+        categories = get_all_categories()
+        self.parts_category_combo.configure(values=[""] + categories)
+        self.parts_category_combo.current(0)
+        parts_list = ["全部"]
+        self.history_part_map = {"全部": None}
+        for p in get_all_parts():
+            label = f"{p['part_code']} {p['part_name']}"
+            parts_list.append(label)
+            self.history_part_map[label] = p["id"]
+        self.history_combo.configure(values=parts_list)
+        self.history_combo.current(0)
+        self._refresh_borrower_combo()
+        self._wb_refresh_borrower_combo()
+
+        restore_result = restore_workbench_state(self.current_user["id"], self.current_user["role"])
+
+        self._apply_restored_state_to_workbench(restore_result)
+        self._apply_restored_state_to_borrow_tab(restore_result)
+
+        self._wb_refresh_records(log_query=False)
+        self._refresh_borrow(log_query=False)
+
+        self._refresh_parts()
+        self._refresh_approval()
+        self._refresh_history()
+        self._refresh_logs()
+
+        if restore_result.warnings:
+            hint = " | ".join(restore_result.warnings)
+            self.restore_hint_label.configure(text=f"恢复提示: {hint}")
+            if len(restore_result.warnings) == 1 and "方案" in restore_result.warnings[0]:
+                pass
+            else:
+                pass
+        else:
+            self.restore_hint_label.configure(text="")
 
     def _update_button_permissions(self):
         is_supervisor = self.current_user and self.current_user["role"] == "supervisor"
@@ -731,12 +893,350 @@ class MainApp(tk.Tk):
         self.history_combo.configure(values=parts_list)
         self.history_combo.current(0)
         self._refresh_borrower_combo()
+        self._wb_refresh_borrower_combo()
         self._refresh_scheme_combo()
+        self._wb_refresh_scheme_combo()
         self._refresh_parts()
         self._refresh_borrow()
+        self._wb_refresh_records()
         self._refresh_approval()
         self._refresh_history()
         self._refresh_logs()
+
+    def _wb_refresh_borrower_combo(self):
+        users = get_all_users()
+        borrower_labels = ["全部"]
+        self._wb_borrower_map = {"全部": None}
+        for u in users:
+            label = f"{u['display_name']} ({u['username']})"
+            borrower_labels.append(label)
+            self._wb_borrower_map[label] = u["id"]
+        self.wb_borrower_combo.configure(values=borrower_labels)
+        self.wb_borrower_combo.current(0)
+
+    def _wb_refresh_scheme_combo(self):
+        if not self.current_user:
+            return
+        schemes = get_available_schemes(self.current_user["id"], self.current_user["role"])
+        scheme_labels = [""]
+        self._wb_scheme_map = {}
+        for s in schemes:
+            scope_tag = "[共享]" if s["scope"] == "shared" else "[个人]"
+            owner_hint = ""
+            if s["scope"] == "shared" and s.get("owner_name"):
+                owner_hint = f"({s['owner_name']})"
+            label = f"{scope_tag} {s['name']} {owner_hint}".strip()
+            scheme_labels.append(label)
+            self._wb_scheme_map[label] = s["id"]
+        self.wb_scheme_combo.configure(values=scheme_labels)
+        active_id = get_active_scheme_id(self.current_user["id"])
+        if active_id:
+            found = False
+            for lbl, sid in self._wb_scheme_map.items():
+                if sid == active_id:
+                    self.wb_scheme_var.set(lbl)
+                    found = True
+                    break
+            if not found:
+                self.wb_scheme_combo.set("")
+        else:
+            self.wb_scheme_combo.set("")
+
+    def _collect_wb_filters(self):
+        status_label = self.wb_status.get()
+        status = self._wb_status_map.get(status_label, "")
+        keyword = self.wb_keyword.get().strip()
+        borrower_label = self.wb_borrower.get()
+        borrower_id = self._wb_borrower_map.get(borrower_label)
+        date_from = self.wb_date_from.get().strip()
+        date_to = self.wb_date_to.get().strip()
+        filters = {}
+        if status:
+            filters["status"] = status
+        if keyword:
+            filters["keyword"] = keyword
+        if borrower_id:
+            filters["borrower_id"] = borrower_id
+        if date_from:
+            filters["date_from"] = date_from
+        if date_to:
+            filters["date_to"] = date_to
+        return filters
+
+    def _apply_restored_state_to_workbench(self, restore_result):
+        if not self.current_user:
+            return
+        self._wb_refresh_scheme_combo()
+        if restore_result.scheme:
+            scheme = restore_result.scheme
+            self.wb_active_scheme_label.configure(text=f"{scheme['name']}", foreground="#409EFF")
+            for lbl, sid in self._wb_scheme_map.items():
+                if sid == scheme["id"]:
+                    self.wb_scheme_var.set(lbl)
+                    break
+        else:
+            self.wb_active_scheme_label.configure(text="未激活", foreground="#909399")
+        filters = restore_result.filters or {}
+        status_val = filters.get("status", "")
+        matched = False
+        for lbl, val in self._wb_status_map.items():
+            if val == status_val:
+                self.wb_status.set(lbl)
+                matched = True
+                break
+        if not matched:
+            self.wb_status_combo.current(0)
+        keyword_val = filters.get("keyword", "")
+        self.wb_keyword.set(keyword_val)
+        borrower_id_val = filters.get("borrower_id")
+        if borrower_id_val:
+            matched_borrower = False
+            for lbl, bid in self._wb_borrower_map.items():
+                if bid == borrower_id_val:
+                    self.wb_borrower.set(lbl)
+                    matched_borrower = True
+                    break
+            if not matched_borrower:
+                self.wb_borrower_combo.current(0)
+        else:
+            self.wb_borrower_combo.current(0)
+        date_from_val = filters.get("date_from", "")
+        self.wb_date_from.set(date_from_val)
+        date_to_val = filters.get("date_to", "")
+        self.wb_date_to.set(date_to_val)
+
+    def _apply_restored_state_to_borrow_tab(self, restore_result):
+        if not self.current_user:
+            return
+        self._refresh_scheme_combo()
+        if restore_result.scheme:
+            scheme = restore_result.scheme
+            self.active_scheme_id = scheme["id"]
+            self.active_scheme_label.configure(text=f"当前方案: {scheme['name']}")
+            for lbl, sid in self._scheme_map.items():
+                if sid == scheme["id"]:
+                    self.scheme_var.set(lbl)
+                    break
+        else:
+            self.active_scheme_id = None
+            self.active_scheme_label.configure(text="")
+        filters = restore_result.filters or {}
+        status_val = filters.get("status", "")
+        matched = False
+        for lbl, val in self._status_map.items():
+            if val == status_val:
+                self.borrow_status.set(lbl)
+                matched = True
+                break
+        if not matched:
+            self.borrow_status_combo.current(0)
+        keyword_val = filters.get("keyword", "")
+        self.borrow_keyword.set(keyword_val)
+        borrower_id_val = filters.get("borrower_id")
+        if borrower_id_val:
+            matched_borrower = False
+            for lbl, bid in self._borrower_map.items():
+                if bid == borrower_id_val:
+                    self.borrow_person.set(lbl)
+                    matched_borrower = True
+                    break
+            if not matched_borrower:
+                self.borrow_person_combo.current(0)
+        else:
+            self.borrow_person_combo.current(0)
+        date_from_val = filters.get("date_from", "")
+        self.date_from_var.set(date_from_val)
+        date_to_val = filters.get("date_to", "")
+        self.date_to_var.set(date_to_val)
+
+    def _wb_refresh_records(self, log_query=True):
+        filters = self._collect_wb_filters()
+        records = get_borrow_records(**filters)
+        for item in self.wb_tree.get_children():
+            self.wb_tree.delete(item)
+        for r in records:
+            status_text, _ = STATUS_DISPLAY.get(r["status"], (r["status"], ""))
+            self.wb_tree.insert("", "end", iid=str(r["id"]), values=(
+                r["record_no"], r["part_code"], r["part_name"],
+                r["quantity"], r["unit"], r["borrower_name"],
+                status_text, r["created_at"]
+            ), tags=(r["status"],))
+        self.wb_count_label.configure(text=f"{len(records)} 条")
+        if self.current_user and log_query:
+            log_query_operation(self.current_user["id"], filters, len(records))
+        if not _is_filter_empty(filters) and self.current_user:
+            save_last_filters(self.current_user["id"], filters)
+
+    def _wb_reset_filters(self):
+        self.wb_status_combo.current(0)
+        self.wb_keyword.set("")
+        self.wb_borrower_combo.current(0)
+        self.wb_date_from.set("")
+        self.wb_date_to.set("")
+        deactivate_scheme(self.current_user["id"])
+        self.wb_active_scheme_label.configure(text="未激活", foreground="#909399")
+        self.wb_scheme_combo.set("")
+        self.active_scheme_id = None
+        self.active_scheme_label.configure(text="")
+        self.scheme_combo.set("")
+        if self.current_user:
+            save_last_filters(self.current_user["id"], {})
+        self._wb_refresh_records()
+        self._refresh_borrow()
+
+    def _on_wb_scheme_selected(self, event=None):
+        pass
+
+    def _wb_activate_scheme(self):
+        label = self.wb_scheme_var.get()
+        scheme_id = self._wb_scheme_map.get(label)
+        if not scheme_id:
+            messagebox.showinfo("提示", "请先从下拉列表选择一个方案", parent=self)
+            return
+        try:
+            scheme = activate_scheme(self.current_user["id"], scheme_id, self.current_user["role"])
+            self.wb_active_scheme_label.configure(text=f"{scheme['name']}", foreground="#409EFF")
+            self._apply_restored_state_to_workbench(RestoreResult(success=True, scheme=scheme, filters=scheme["filters"]))
+            self._apply_restored_state_to_borrow_tab(RestoreResult(success=True, scheme=scheme, filters=scheme["filters"]))
+            self._wb_refresh_records()
+            self._refresh_borrow()
+            messagebox.showinfo("成功", f"方案「{scheme['name']}」已激活，条件已套用", parent=self)
+        except BusinessException as e:
+            messagebox.showerror("激活失败", e.message, parent=self)
+
+    def _wb_save_scheme(self):
+        if not self.current_user:
+            return
+        filters = self._collect_wb_filters()
+        if _is_filter_empty(filters):
+            messagebox.showwarning("提示", "当前筛选条件全部为空，无法保存方案", parent=self)
+            return
+        dlg = SaveSchemeDialog(self, self.current_user, get_active_scheme_id(self.current_user["id"]))
+        self.wait_window(dlg)
+        if dlg.result:
+            try:
+                scheme_id = save_filter_scheme(
+                    name=dlg.result["name"],
+                    owner_id=self.current_user["id"],
+                    filters=filters,
+                    scope=dlg.result["scope"],
+                    scheme_id=dlg.result.get("scheme_id"),
+                    role=self.current_user["role"]
+                )
+                activate_scheme(self.current_user["id"], scheme_id, self.current_user["role"])
+                self._wb_refresh_scheme_combo()
+                self._refresh_scheme_combo()
+                scheme = get_filter_scheme_by_id(scheme_id)
+                if scheme:
+                    self.wb_active_scheme_label.configure(text=f"{scheme['name']}", foreground="#409EFF")
+                    self.active_scheme_id = scheme_id
+                    self.active_scheme_label.configure(text=f"当前方案: {scheme['name']}")
+                    for lbl, sid in self._wb_scheme_map.items():
+                        if sid == scheme_id:
+                            self.wb_scheme_var.set(lbl)
+                            break
+                    for lbl, sid in self._scheme_map.items():
+                        if sid == scheme_id:
+                            self.scheme_var.set(lbl)
+                            break
+                messagebox.showinfo("成功", f"方案「{dlg.result['name']}」已保存并激活", parent=self)
+            except BusinessException as e:
+                messagebox.showerror("保存失败", e.message, parent=self)
+
+    def _wb_delete_scheme(self):
+        label = self.wb_scheme_var.get()
+        scheme_id = self._wb_scheme_map.get(label)
+        if not scheme_id:
+            messagebox.showinfo("提示", "请先从下拉列表选择一个方案", parent=self)
+            return
+        scheme = get_filter_scheme_by_id(scheme_id)
+        if not scheme:
+            messagebox.showwarning("提示", "方案已不存在", parent=self)
+            self._wb_refresh_scheme_combo()
+            self._wb_check_active_scheme_valid()
+            return
+        if not messagebox.askyesno("确认", f"确定要删除方案「{scheme['name']}」吗？", parent=self):
+            return
+        try:
+            was_active = delete_scheme_and_cleanup(scheme_id, self.current_user["id"], self.current_user["role"])
+            self._wb_refresh_scheme_combo()
+            self._refresh_scheme_combo()
+            if was_active:
+                self.wb_active_scheme_label.configure(text="未激活", foreground="#909399")
+                self.active_scheme_id = None
+                self.active_scheme_label.configure(text="")
+                messagebox.showinfo("提示", "方案已删除，当前视图已回退为上次使用的筛选条件", parent=self)
+            else:
+                messagebox.showinfo("成功", f"方案「{scheme['name']}」已删除", parent=self)
+            self._wb_refresh_records()
+            self._refresh_borrow()
+        except BusinessException as e:
+            messagebox.showerror("删除失败", e.message, parent=self)
+
+    def _wb_check_active_scheme_valid(self):
+        active_id = get_active_scheme_id(self.current_user["id"])
+        if active_id:
+            scheme = get_filter_scheme_by_id(active_id)
+            if not scheme or not _can_access_scheme(scheme, self.current_user["id"], self.current_user["role"]):
+                deactivate_scheme(self.current_user["id"])
+                self.wb_active_scheme_label.configure(text="未激活", foreground="#909399")
+                self.active_scheme_id = None
+                self.active_scheme_label.configure(text="")
+
+    def _wb_export_csv(self):
+        filters = self._collect_wb_filters()
+        filename = generate_default_filename("workbench_borrow_records")
+        path = filedialog.asksaveasfilename(
+            parent=self, title="工作台-导出借还记录", defaultextension=".csv",
+            initialfile=filename, filetypes=[("CSV文件", "*.csv")]
+        )
+        if not path:
+            return
+        try:
+            count = export_borrow_records(path, **filters)
+            self._wb_last_export_path = path
+            self._wb_last_export_filters = dict(filters)
+            scheme_id = get_active_scheme_id(self.current_user["id"]) if self.current_user else None
+            if self.current_user:
+                log_export_operation(self.current_user["id"], filters, count, os.path.basename(path), scheme_id)
+            scheme_note = ""
+            active_id = get_active_scheme_id(self.current_user["id"])
+            if active_id:
+                scheme = get_filter_scheme_by_id(active_id)
+                if scheme:
+                    scheme_note = f" (按方案「{scheme['name']}」筛选)"
+            self.wb_verify_result_label.configure(text="", foreground="#67C23A")
+            messagebox.showinfo("成功", f"已导出 {count} 条记录到:\n{path}{scheme_note}", parent=self)
+        except Exception as e:
+            messagebox.showerror("错误", f"导出失败: {e}", parent=self)
+
+    def _wb_verify_export(self):
+        if not self._wb_last_export_path or not os.path.exists(self._wb_last_export_path):
+            messagebox.showinfo("提示", "请先导出CSV文件再进行一致性校验", parent=self)
+            return
+        filters = self._wb_last_export_filters or self._collect_wb_filters()
+        result = verify_export_consistency(self._wb_last_export_path, filters)
+        if result["consistent"]:
+            self.wb_verify_result_label.configure(
+                text=f"✓ 一致 (DB:{result['db_count']}条 / CSV:{result['csv_count']}条)",
+                foreground="#67C23A"
+            )
+            messagebox.showinfo("校验通过",
+                                f"CSV导出与数据库查询结果完全一致！\n"
+                                f"数据库: {result['db_count']} 条\n"
+                                f"CSV文件: {result['csv_count']} 条",
+                                parent=self)
+        else:
+            self.wb_verify_result_label.configure(
+                text=f"✗ 不一致: {result['reason']}",
+                foreground="#F56C6C"
+            )
+            messagebox.showerror("校验失败",
+                                 f"CSV导出与查询结果不一致！\n"
+                                 f"原因: {result['reason']}\n"
+                                 f"数据库: {result['db_count']} 条\n"
+                                 f"CSV文件: {result['csv_count']} 条",
+                                 parent=self)
 
     def _reset_parts_filter(self):
         self.parts_keyword.set("")
@@ -977,7 +1477,7 @@ class MainApp(tk.Tk):
             ), tags=(tag,))
         self._set_status(f"备件查询完成，共 {len(self.parts_tree.get_children())} 条记录")
 
-    def _refresh_borrow(self):
+    def _refresh_borrow(self, log_query=True):
         status_label = self.borrow_status.get()
         status = self._status_map.get(status_label, "")
         status = status or None
@@ -986,6 +1486,17 @@ class MainApp(tk.Tk):
         borrower_id = self._borrower_map.get(borrower_label)
         date_from = self.date_from_var.get().strip() or None
         date_to = self.date_to_var.get().strip() or None
+        filters = {}
+        if status:
+            filters["status"] = status
+        if keyword:
+            filters["keyword"] = keyword
+        if borrower_id:
+            filters["borrower_id"] = borrower_id
+        if date_from:
+            filters["date_from"] = date_from
+        if date_to:
+            filters["date_to"] = date_to
         for item in self.borrow_tree.get_children():
             self.borrow_tree.delete(item)
         records = get_borrow_records(status=status, keyword=keyword, borrower_id=borrower_id,
@@ -1008,6 +1519,10 @@ class MainApp(tk.Tk):
                 self.active_scheme_id = None
                 self.active_scheme_label.configure(text="")
         self._set_status(f"借还记录查询完成，共 {len(records)} 条记录{scheme_hint}")
+        if self.current_user and log_query:
+            log_query_operation(self.current_user["id"], filters, len(records))
+        if not _is_filter_empty(filters) and self.current_user:
+            save_last_filters(self.current_user["id"], filters)
 
     def _refresh_approval(self):
         for item in self.approval_tree.get_children():
@@ -1281,6 +1796,17 @@ class MainApp(tk.Tk):
         borrower_id = self._borrower_map.get(borrower_label)
         date_from = self.date_from_var.get().strip() or None
         date_to = self.date_to_var.get().strip() or None
+        filters = {}
+        if status:
+            filters["status"] = status
+        if keyword:
+            filters["keyword"] = keyword
+        if borrower_id:
+            filters["borrower_id"] = borrower_id
+        if date_from:
+            filters["date_from"] = date_from
+        if date_to:
+            filters["date_to"] = date_to
         filename = generate_default_filename("borrow_records")
         path = filedialog.asksaveasfilename(
             parent=self, title="导出借还记录", defaultextension=".csv",
@@ -1290,6 +1816,10 @@ class MainApp(tk.Tk):
             try:
                 count = export_borrow_records(path, status=status, borrower_id=borrower_id,
                                               keyword=keyword, date_from=date_from, date_to=date_to)
+                scheme_id = self.active_scheme_id if hasattr(self, 'active_scheme_id') else None
+                if self.current_user:
+                    log_export_operation(self.current_user["id"], filters, count,
+                                         os.path.basename(path), scheme_id)
                 scheme_note = ""
                 if self.active_scheme_id:
                     scheme = get_filter_scheme_by_id(self.active_scheme_id)
