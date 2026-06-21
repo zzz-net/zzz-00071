@@ -7,7 +7,8 @@ from services import (
     get_part_by_id, create_part, update_part, adjust_stock, delete_part,
     submit_borrow, approve_borrow, reject_borrow, return_part, rollback_borrow,
     cancel_borrow, undo_return, get_borrow_records, get_borrow_record, get_stock_logs,
-    get_operation_logs, STATUS_DISPLAY, OPERATION_DISPLAY, BusinessException
+    get_operation_logs, STATUS_DISPLAY, OPERATION_DISPLAY, BusinessException,
+    save_filter_scheme, get_filter_schemes, delete_filter_scheme, get_filter_scheme_by_id
 )
 from exporter import (
     export_stock_details, export_borrow_records, export_stock_logs,
@@ -312,6 +313,57 @@ class StockAdjustDialog(tk.Toplevel):
             messagebox.showerror("错误", "请输入有效的数量", parent=self)
 
 
+class SaveSchemeDialog(tk.Toplevel):
+    def __init__(self, master, current_user, active_scheme_id=None):
+        super().__init__(master)
+        self.title("保存筛选方案")
+        self.geometry("400x220")
+        self.resizable(False, False)
+        self.current_user = current_user
+        self.active_scheme_id = active_scheme_id
+        self.result = None
+        self._build_ui()
+        self.grab_set()
+        self.transient(master)
+
+    def _build_ui(self):
+        frame = ttk.Frame(self, padding=20)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="方案名称*:").grid(row=0, column=0, sticky="w", pady=8)
+        self.name_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.name_var, width=30).grid(row=0, column=1, sticky="w", pady=8)
+        ttk.Label(frame, text="可见范围:").grid(row=1, column=0, sticky="w", pady=8)
+        self.scope_var = tk.StringVar(value="personal")
+        scope_frame = ttk.Frame(frame)
+        scope_frame.grid(row=1, column=1, sticky="w", pady=8)
+        ttk.Radiobutton(scope_frame, text="仅自己", variable=self.scope_var, value="personal").pack(side="left")
+        ttk.Radiobutton(scope_frame, text="共享(所有人可见)", variable=self.scope_var,
+                         value="shared").pack(side="left", padx=10)
+        if self.current_user["role"] != "supervisor":
+            pass
+        if self.active_scheme_id:
+            scheme = get_filter_scheme_by_id(self.active_scheme_id)
+            if scheme:
+                self.name_var.set(scheme["name"])
+                self.scope_var.set(scheme["scope"])
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=2, column=0, columnspan=2, pady=20)
+        ttk.Button(btn_frame, text="保存", command=self._on_ok, width=12).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="取消", command=self.destroy, width=12).pack(side="left", padx=5)
+
+    def _on_ok(self):
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showwarning("提示", "方案名称不能为空", parent=self)
+            return
+        self.result = {
+            "name": name,
+            "scope": self.scope_var.get(),
+            "scheme_id": self.active_scheme_id
+        }
+        self.destroy()
+
+
 class MainApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -427,24 +479,60 @@ class MainApp(tk.Tk):
         tab = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(tab, text="借还记录")
 
-        filter_frame = ttk.Frame(tab)
-        filter_frame.pack(fill="x", pady=(0, 8))
-        ttk.Label(filter_frame, text="状态:").pack(side="left")
+        scheme_frame = ttk.LabelFrame(tab, text="筛选方案", padding=5)
+        scheme_frame.pack(fill="x", pady=(0, 5))
+        ttk.Label(scheme_frame, text="方案:").pack(side="left")
+        self.scheme_var = tk.StringVar()
+        self.scheme_combo = ttk.Combobox(scheme_frame, textvariable=self.scheme_var,
+                                          state="readonly", width=18)
+        self.scheme_combo.pack(side="left", padx=5)
+        self.scheme_combo.bind("<<ComboboxSelected>>", self._on_scheme_selected)
+        ttk.Button(scheme_frame, text="套用", command=self._apply_scheme, width=6).pack(side="left", padx=2)
+        ttk.Button(scheme_frame, text="保存当前条件", command=self._save_scheme, width=12).pack(side="left", padx=2)
+        ttk.Button(scheme_frame, text="删除方案", command=self._delete_scheme, width=8).pack(side="left", padx=2)
+        self.active_scheme_id = None
+        self.active_scheme_label = ttk.Label(scheme_frame, text="", foreground="#409EFF")
+        self.active_scheme_label.pack(side="left", padx=10)
+
+        filter_frame = ttk.LabelFrame(tab, text="筛选条件", padding=5)
+        filter_frame.pack(fill="x", pady=(0, 5))
+
+        row1 = ttk.Frame(filter_frame)
+        row1.pack(fill="x", pady=2)
+        ttk.Label(row1, text="状态:").pack(side="left")
         self.borrow_status = tk.StringVar()
         statuses = [("全部", ""), ("待审批", "pending_approval"), ("已借出", "approved"),
-                    ("已归还", "returned"), ("已驳回", "rejected"), ("已回滚", "rollback"),
-                    ("已撤销", "cancelled")]
+                    ("已借出(部分归还)", "borrowed"), ("已归还", "returned"), ("已驳回", "rejected"),
+                    ("已回滚", "rollback"), ("已撤销", "cancelled")]
         self.borrow_status_combo = ttk.Combobox(
-            filter_frame, textvariable=self.borrow_status, state="readonly", width=12,
+            row1, textvariable=self.borrow_status, state="readonly", width=14,
             values=[s[0] for s in statuses]
         )
         self.borrow_status_combo.current(0)
         self.borrow_status_combo.pack(side="left", padx=5)
         self._status_map = {s[0]: s[1] for s in statuses}
-        ttk.Label(filter_frame, text="搜索:").pack(side="left", padx=(15, 0))
+        ttk.Label(row1, text="借用人:").pack(side="left", padx=(10, 0))
+        self.borrow_person = tk.StringVar()
+        self.borrow_person_combo = ttk.Combobox(row1, textvariable=self.borrow_person,
+                                                 state="readonly", width=12)
+        self.borrow_person_combo.pack(side="left", padx=5)
+        self._borrower_map = {}
+        ttk.Label(row1, text="关键字:").pack(side="left", padx=(10, 0))
         self.borrow_keyword = tk.StringVar()
-        ttk.Entry(filter_frame, textvariable=self.borrow_keyword, width=25).pack(side="left", padx=5)
-        ttk.Button(filter_frame, text="查询", command=self._refresh_borrow, width=8).pack(side="left", padx=5)
+        ttk.Entry(row1, textvariable=self.borrow_keyword, width=20).pack(side="left", padx=5)
+
+        row2 = ttk.Frame(filter_frame)
+        row2.pack(fill="x", pady=2)
+        ttk.Label(row2, text="开始日期:").pack(side="left")
+        self.date_from_var = tk.StringVar()
+        ttk.Entry(row2, textvariable=self.date_from_var, width=14).pack(side="left", padx=5)
+        ttk.Label(row2, text="(如 2025-01-01)").pack(side="left", foreground="#909399")
+        ttk.Label(row2, text="结束日期:").pack(side="left", padx=(15, 0))
+        self.date_to_var = tk.StringVar()
+        ttk.Entry(row2, textvariable=self.date_to_var, width=14).pack(side="left", padx=5)
+        ttk.Label(row2, text="(如 2025-12-31)").pack(side="left", foreground="#909399")
+        ttk.Button(row2, text="查询", command=self._refresh_borrow, width=8).pack(side="left", padx=10)
+        ttk.Button(row2, text="重置", command=self._reset_borrow_filter, width=8).pack(side="left", padx=2)
 
         btn_frame = ttk.Frame(tab)
         btn_frame.pack(fill="x", pady=(0, 8))
@@ -457,7 +545,7 @@ class MainApp(tk.Tk):
         self.btn_cancel = ttk.Button(btn_frame, text="撤销申请", command=self._cancel_record, width=10)
         self.btn_cancel.pack(side="left", padx=3)
         ttk.Separator(btn_frame, orient="vertical").pack(side="left", fill="y", padx=10)
-        ttk.Button(btn_frame, text="导出借还记录", command=self._export_borrow, width=14).pack(side="left", padx=3)
+        ttk.Button(btn_frame, text="按当前条件导出CSV", command=self._export_borrow, width=18).pack(side="left", padx=3)
 
         columns = ("record_no", "part_code", "part_name", "quantity", "unit", "borrower",
                    "purpose", "status", "approver", "created_at", "return_qty")
@@ -484,6 +572,7 @@ class MainApp(tk.Tk):
         self.borrow_tree.tag_configure("returned", background="#F0F9EB")
         self.borrow_tree.tag_configure("rollback", background="#F4F4F5")
         self.borrow_tree.tag_configure("cancelled", background="#F4F4F5")
+        self.borrow_tree.tag_configure("borrowed", background="#ECF5FF")
         vsb = ttk.Scrollbar(tab, orient="vertical", command=self.borrow_tree.yview)
         self.borrow_tree.configure(yscrollcommand=vsb.set)
         self.borrow_tree.pack(side="left", fill="both", expand=True)
@@ -629,6 +718,8 @@ class MainApp(tk.Tk):
             self.history_part_map[label] = p["id"]
         self.history_combo.configure(values=parts_list)
         self.history_combo.current(0)
+        self._refresh_borrower_combo()
+        self._refresh_scheme_combo()
         self._refresh_parts()
         self._refresh_borrow()
         self._refresh_approval()
@@ -641,6 +732,174 @@ class MainApp(tk.Tk):
         self.parts_category_combo.configure(values=[""] + get_all_categories())
         self.parts_category_combo.current(0)
         self._refresh_parts()
+
+    def _reset_borrow_filter(self):
+        self.borrow_status_combo.current(0)
+        self.borrow_keyword.set("")
+        self.borrow_person_combo.current(0)
+        self.date_from_var.set("")
+        self.date_to_var.set("")
+        self.active_scheme_id = None
+        self.active_scheme_label.configure(text="")
+        self.scheme_combo.set("")
+        self._refresh_borrow()
+
+    def _refresh_borrower_combo(self):
+        users = get_all_users()
+        borrower_labels = ["全部"]
+        self._borrower_map = {"全部": None}
+        for u in users:
+            label = f"{u['display_name']} ({u['username']})"
+            borrower_labels.append(label)
+            self._borrower_map[label] = u["id"]
+        self.borrow_person_combo.configure(values=borrower_labels)
+        self.borrow_person_combo.current(0)
+
+    def _refresh_scheme_combo(self):
+        if not self.current_user:
+            return
+        schemes = get_filter_schemes(self.current_user["id"], self.current_user["role"])
+        scheme_labels = [""]
+        self._scheme_map = {}
+        for s in schemes:
+            scope_tag = "[共享]" if s["scope"] == "shared" else "[个人]"
+            label = f"{scope_tag} {s['name']}"
+            scheme_labels.append(label)
+            self._scheme_map[label] = s["id"]
+        self.scheme_combo.configure(values=scheme_labels)
+        if self.active_scheme_id:
+            found = False
+            for lbl, sid in self._scheme_map.items():
+                if sid == self.active_scheme_id:
+                    self.scheme_var.set(lbl)
+                    found = True
+                    break
+            if not found:
+                self.active_scheme_id = None
+                self.active_scheme_label.configure(text="")
+                self.scheme_combo.set("")
+        else:
+            self.scheme_combo.set("")
+
+    def _on_scheme_selected(self, event=None):
+        pass
+
+    def _apply_scheme(self):
+        label = self.scheme_var.get()
+        scheme_id = self._scheme_map.get(label)
+        if not scheme_id:
+            messagebox.showinfo("提示", "请先从下拉列表选择一个方案", parent=self)
+            return
+        scheme = get_filter_scheme_by_id(scheme_id)
+        if not scheme:
+            messagebox.showwarning("提示", "方案已被删除，将重置为默认视图", parent=self)
+            self.active_scheme_id = None
+            self.active_scheme_label.configure(text="")
+            self._reset_borrow_filter()
+            return
+        filters = scheme["filters"]
+        status_val = filters.get("status", "")
+        matched = False
+        for lbl, val in self._status_map.items():
+            if val == status_val:
+                self.borrow_status.set(lbl)
+                matched = True
+                break
+        if not matched:
+            self.borrow_status_combo.current(0)
+        keyword_val = filters.get("keyword", "")
+        self.borrow_keyword.set(keyword_val)
+        borrower_id_val = filters.get("borrower_id")
+        if borrower_id_val:
+            matched_borrower = False
+            for lbl, bid in self._borrower_map.items():
+                if bid == borrower_id_val:
+                    self.borrow_person.set(lbl)
+                    matched_borrower = True
+                    break
+            if not matched_borrower:
+                self.borrow_person_combo.current(0)
+        else:
+            self.borrow_person_combo.current(0)
+        date_from_val = filters.get("date_from", "")
+        self.date_from_var.set(date_from_val)
+        date_to_val = filters.get("date_to", "")
+        self.date_to_var.set(date_to_val)
+        self.active_scheme_id = scheme_id
+        self.active_scheme_label.configure(text=f"当前方案: {scheme['name']}")
+        self._refresh_borrow()
+
+    def _save_scheme(self):
+        if not self.current_user:
+            return
+        filters = self._collect_current_filters()
+        from services import _is_filter_empty
+        if _is_filter_empty(filters):
+            messagebox.showwarning("提示", "当前筛选条件全部为空，无法保存方案", parent=self)
+            return
+        dlg = SaveSchemeDialog(self, self.current_user, self.active_scheme_id)
+        self.wait_window(dlg)
+        if dlg.result:
+            try:
+                scheme_id = save_filter_scheme(
+                    name=dlg.result["name"],
+                    owner_id=self.current_user["id"],
+                    filters=filters,
+                    scope=dlg.result["scope"],
+                    scheme_id=dlg.result.get("scheme_id")
+                )
+                self.active_scheme_id = scheme_id
+                self._refresh_scheme_combo()
+                scheme = get_filter_scheme_by_id(scheme_id)
+                if scheme:
+                    self.active_scheme_label.configure(text=f"当前方案: {scheme['name']}")
+                messagebox.showinfo("成功", f"方案「{dlg.result['name']}」已保存", parent=self)
+            except BusinessException as e:
+                messagebox.showerror("保存失败", e.message, parent=self)
+
+    def _delete_scheme(self):
+        label = self.scheme_var.get()
+        scheme_id = self._scheme_map.get(label)
+        if not scheme_id:
+            messagebox.showinfo("提示", "请先从下拉列表选择一个方案", parent=self)
+            return
+        scheme = get_filter_scheme_by_id(scheme_id)
+        if not scheme:
+            messagebox.showwarning("提示", "方案已不存在", parent=self)
+            self._refresh_scheme_combo()
+            return
+        if not messagebox.askyesno("确认", f"确定要删除方案「{scheme['name']}」吗？", parent=self):
+            return
+        try:
+            delete_filter_scheme(scheme_id, self.current_user["id"], self.current_user["role"])
+            if self.active_scheme_id == scheme_id:
+                self.active_scheme_id = None
+                self.active_scheme_label.configure(text="")
+            self._refresh_scheme_combo()
+            messagebox.showinfo("成功", f"方案「{scheme['name']}」已删除", parent=self)
+        except BusinessException as e:
+            messagebox.showerror("删除失败", e.message, parent=self)
+
+    def _collect_current_filters(self):
+        status_label = self.borrow_status.get()
+        status = self._status_map.get(status_label, "")
+        keyword = self.borrow_keyword.get().strip()
+        borrower_label = self.borrow_person.get()
+        borrower_id = self._borrower_map.get(borrower_label)
+        date_from = self.date_from_var.get().strip()
+        date_to = self.date_to_var.get().strip()
+        filters = {}
+        if status:
+            filters["status"] = status
+        if keyword:
+            filters["keyword"] = keyword
+        if borrower_id:
+            filters["borrower_id"] = borrower_id
+        if date_from:
+            filters["date_from"] = date_from
+        if date_to:
+            filters["date_to"] = date_to
+        return filters
 
     def _refresh_parts(self):
         keyword = self.parts_keyword.get().strip() or None
@@ -675,9 +934,14 @@ class MainApp(tk.Tk):
         status = self._status_map.get(status_label, "")
         status = status or None
         keyword = self.borrow_keyword.get().strip() or None
+        borrower_label = self.borrow_person.get()
+        borrower_id = self._borrower_map.get(borrower_label)
+        date_from = self.date_from_var.get().strip() or None
+        date_to = self.date_to_var.get().strip() or None
         for item in self.borrow_tree.get_children():
             self.borrow_tree.delete(item)
-        records = get_borrow_records(status=status, keyword=keyword)
+        records = get_borrow_records(status=status, keyword=keyword, borrower_id=borrower_id,
+                                     date_from=date_from, date_to=date_to)
         for r in records:
             status_text, _ = STATUS_DISPLAY.get(r["status"], (r["status"], ""))
             self.borrow_tree.insert("", "end", iid=str(r["id"]), values=(
@@ -687,7 +951,15 @@ class MainApp(tk.Tk):
                 r.get("approver_name", "") or "",
                 r["created_at"], r["return_quantity"]
             ), tags=(r["status"],))
-        self._set_status(f"借还记录查询完成，共 {len(records)} 条记录")
+        scheme_hint = ""
+        if self.active_scheme_id:
+            scheme = get_filter_scheme_by_id(self.active_scheme_id)
+            if scheme:
+                scheme_hint = f" [方案: {scheme['name']}]"
+            else:
+                self.active_scheme_id = None
+                self.active_scheme_label.configure(text="")
+        self._set_status(f"借还记录查询完成，共 {len(records)} 条记录{scheme_hint}")
 
     def _refresh_approval(self):
         for item in self.approval_tree.get_children():
@@ -956,6 +1228,11 @@ class MainApp(tk.Tk):
         status_label = self.borrow_status.get()
         status = self._status_map.get(status_label, "")
         status = status or None
+        keyword = self.borrow_keyword.get().strip() or None
+        borrower_label = self.borrow_person.get()
+        borrower_id = self._borrower_map.get(borrower_label)
+        date_from = self.date_from_var.get().strip() or None
+        date_to = self.date_to_var.get().strip() or None
         filename = generate_default_filename("borrow_records")
         path = filedialog.asksaveasfilename(
             parent=self, title="导出借还记录", defaultextension=".csv",
@@ -963,8 +1240,14 @@ class MainApp(tk.Tk):
         )
         if path:
             try:
-                count = export_borrow_records(path, status)
-                messagebox.showinfo("成功", f"已导出 {count} 条记录到:\n{path}", parent=self)
+                count = export_borrow_records(path, status=status, borrower_id=borrower_id,
+                                              keyword=keyword, date_from=date_from, date_to=date_to)
+                scheme_note = ""
+                if self.active_scheme_id:
+                    scheme = get_filter_scheme_by_id(self.active_scheme_id)
+                    if scheme:
+                        scheme_note = f" (按方案「{scheme['name']}」筛选)"
+                messagebox.showinfo("成功", f"已导出 {count} 条记录到:\n{path}{scheme_note}", parent=self)
             except Exception as e:
                 messagebox.showerror("错误", f"导出失败: {e}", parent=self)
 

@@ -42,8 +42,10 @@ def export_stock_details(file_path):
     return len(parts)
 
 
-def export_borrow_records(file_path, status=None):
-    records = get_borrow_records(status=status)
+def export_borrow_records(file_path, status=None, borrower_id=None, keyword=None,
+                          date_from=None, date_to=None):
+    records = get_borrow_records(status=status, borrower_id=borrower_id, keyword=keyword,
+                                 date_from=date_from, date_to=date_to)
     fieldnames = [
         "记录编号", "备件编码", "备件名称", "借用数量", "单位", "单价(元)", "总金额(元)",
         "借用人", "用途", "状态", "审批人", "审批备注", "审批时间",

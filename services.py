@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import json
 from datetime import datetime
 from database import get_connection, DB_PATH
 
@@ -460,7 +461,8 @@ def cancel_borrow(record_id, operator_id):
                       f"撤销申请 {record['record_no']}")
 
 
-def get_borrow_records(status=None, part_id=None, borrower_id=None, keyword=None):
+def get_borrow_records(status=None, part_id=None, borrower_id=None, keyword=None,
+                       date_from=None, date_to=None):
     with get_connection() as conn:
         sql = """
             SELECT br.*, sp.part_code, sp.part_name, sp.unit, sp.unit_price,
@@ -490,6 +492,12 @@ def get_borrow_records(status=None, part_id=None, borrower_id=None, keyword=None
             sql += " AND (br.record_no LIKE ? OR sp.part_code LIKE ? OR sp.part_name LIKE ?)"
             kw = f"%{keyword}%"
             params.extend([kw, kw, kw])
+        if date_from:
+            sql += " AND br.created_at >= ?"
+            params.append(date_from)
+        if date_to:
+            sql += " AND br.created_at <= ?"
+            params.append(date_to)
         sql += " ORDER BY br.created_at DESC"
         rows = conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
@@ -562,3 +570,102 @@ OPERATION_DISPLAY = {
     "cancel": ("撤销", "#909399"),
     "adjust": ("调整", "#F56C6C"),
 }
+
+
+def _serialize_filters(filters):
+    cleaned = {}
+    for k, v in filters.items():
+        if v is not None and v != "" and v != [] and v != ():
+            cleaned[k] = v
+    return json.dumps(cleaned, ensure_ascii=False)
+
+
+def _deserialize_filters(filters_json):
+    if not filters_json:
+        return {}
+    try:
+        return json.loads(filters_json)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def _is_filter_empty(filters):
+    for v in filters.values():
+        if v is not None and v != "" and v != [] and v != ():
+            return False
+    return True
+
+
+def save_filter_scheme(name, owner_id, filters, scope="personal", scheme_id=None):
+    if not name or not name.strip():
+        raise BusinessException("方案名称不能为空")
+    name = name.strip()
+    if _is_filter_empty(filters):
+        raise BusinessException("筛选条件不能全部为空")
+    filters_json = _serialize_filters(filters)
+    now = datetime.now().isoformat()
+    with get_connection() as conn:
+        if scheme_id:
+            existing = conn.execute("SELECT id, owner_id FROM filter_schemes WHERE id = ?",
+                                    (scheme_id,)).fetchone()
+            if not existing:
+                raise BusinessException("方案不存在")
+            conn.execute("""
+                UPDATE filter_schemes SET name=?, scope=?, filters=?, updated_at=? WHERE id=?
+            """, (name, scope, filters_json, now, scheme_id))
+            log_operation(conn, owner_id, "update_filter_scheme", "filter_scheme", scheme_id,
+                          f"更新筛选方案: {name}")
+            return scheme_id
+        existing = conn.execute(
+            "SELECT id FROM filter_schemes WHERE name = ? AND (owner_id = ? OR scope = 'shared')",
+            (name, owner_id)
+        ).fetchone()
+        if existing:
+            raise BusinessException(f"同名方案已存在: {name}")
+        cursor = conn.execute("""
+            INSERT INTO filter_schemes (name, owner_id, scope, filters, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (name, owner_id, scope, filters_json, now, now))
+        scheme_id = cursor.lastrowid
+        log_operation(conn, owner_id, "save_filter_scheme", "filter_scheme", scheme_id,
+                      f"保存筛选方案: {name}")
+        return scheme_id
+
+
+def get_filter_schemes(user_id, role):
+    with get_connection() as conn:
+        if role == "supervisor":
+            rows = conn.execute("""
+                SELECT * FROM filter_schemes
+                WHERE owner_id = ? OR scope = 'shared'
+                ORDER BY scope DESC, name ASC
+            """, (user_id,)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT * FROM filter_schemes
+                WHERE owner_id = ? OR scope = 'shared'
+                ORDER BY scope DESC, name ASC
+            """, (user_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+
+def delete_filter_scheme(scheme_id, user_id, role):
+    with get_connection() as conn:
+        scheme = conn.execute("SELECT * FROM filter_schemes WHERE id = ?", (scheme_id,)).fetchone()
+        if not scheme:
+            raise BusinessException("方案不存在")
+        if scheme["owner_id"] != user_id and role != "supervisor":
+            raise BusinessException("只能删除自己创建的方案")
+        conn.execute("DELETE FROM filter_schemes WHERE id = ?", (scheme_id,))
+        log_operation(conn, user_id, "delete_filter_scheme", "filter_scheme", scheme_id,
+                      f"删除筛选方案: {scheme['name']}")
+
+
+def get_filter_scheme_by_id(scheme_id):
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM filter_schemes WHERE id = ?", (scheme_id,)).fetchone()
+        if row:
+            result = dict(row)
+            result["filters"] = _deserialize_filters(result["filters"])
+            return result
+        return None

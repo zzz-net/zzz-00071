@@ -118,6 +118,23 @@ def init_db():
         """)
 
         cursor.execute("""
+            CREATE TABLE IF NOT EXISTS filter_schemes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                owner_id INTEGER NOT NULL,
+                scope TEXT NOT NULL DEFAULT 'personal' CHECK(scope IN ('personal', 'shared')),
+                filters TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (owner_id) REFERENCES users(id)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_filter_scheme_owner ON filter_schemes(owner_id)
+        """)
+
+        cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_borrow_part ON borrow_records(part_id)
         """)
         cursor.execute("""
