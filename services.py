@@ -394,7 +394,8 @@ def undo_return(record_id, operator_id, remark=""):
             UPDATE spare_parts SET available_stock=?, updated_at=? WHERE id=?
         """, (after, now, record["part_id"]))
         conn.execute("""
-            UPDATE borrow_records SET return_quantity=0, status='borrowed', updated_at=? WHERE id=?
+            UPDATE borrow_records SET return_quantity=0, return_at=NULL, return_remark=NULL,
+                status='borrowed', updated_at=? WHERE id=?
         """, (now, record_id))
         conn.execute("""
             INSERT INTO stock_logs (part_id, record_id, operation_type, quantity_change,
