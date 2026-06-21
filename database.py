@@ -131,6 +131,17 @@ def init_db():
         """)
 
         cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                user_id INTEGER NOT NULL,
+                pref_key TEXT NOT NULL,
+                pref_value TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, pref_key),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+
+        cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_filter_scheme_owner ON filter_schemes(owner_id)
         """)
 

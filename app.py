@@ -8,7 +8,8 @@ from services import (
     submit_borrow, approve_borrow, reject_borrow, return_part, rollback_borrow,
     cancel_borrow, undo_return, get_borrow_records, get_borrow_record, get_stock_logs,
     get_operation_logs, STATUS_DISPLAY, OPERATION_DISPLAY, BusinessException,
-    save_filter_scheme, get_filter_schemes, delete_filter_scheme, get_filter_scheme_by_id
+    save_filter_scheme, get_filter_schemes, delete_filter_scheme, get_filter_scheme_by_id,
+    set_active_scheme_id, get_active_scheme_id
 )
 from exporter import (
     export_stock_details, export_borrow_records, export_stock_logs,
@@ -317,7 +318,7 @@ class SaveSchemeDialog(tk.Toplevel):
     def __init__(self, master, current_user, active_scheme_id=None):
         super().__init__(master)
         self.title("保存筛选方案")
-        self.geometry("400x220")
+        self.geometry("400x250")
         self.resizable(False, False)
         self.current_user = current_user
         self.active_scheme_id = active_scheme_id
@@ -336,18 +337,28 @@ class SaveSchemeDialog(tk.Toplevel):
         self.scope_var = tk.StringVar(value="personal")
         scope_frame = ttk.Frame(frame)
         scope_frame.grid(row=1, column=1, sticky="w", pady=8)
-        ttk.Radiobutton(scope_frame, text="仅自己", variable=self.scope_var, value="personal").pack(side="left")
-        ttk.Radiobutton(scope_frame, text="共享(所有人可见)", variable=self.scope_var,
-                         value="shared").pack(side="left", padx=10)
-        if self.current_user["role"] != "supervisor":
-            pass
+        is_supervisor = self.current_user["role"] == "supervisor"
+        personal_rb = ttk.Radiobutton(scope_frame, text="仅自己", variable=self.scope_var, value="personal")
+        personal_rb.pack(side="left")
+        shared_rb = ttk.Radiobutton(scope_frame, text="共享(所有人可见)", variable=self.scope_var,
+                                     value="shared")
+        shared_rb.pack(side="left", padx=10)
+        if not is_supervisor:
+            shared_rb.configure(state="disabled")
+            self.scope_var.set("personal")
         if self.active_scheme_id:
             scheme = get_filter_scheme_by_id(self.active_scheme_id)
             if scheme:
                 self.name_var.set(scheme["name"])
                 self.scope_var.set(scheme["scope"])
+                if not is_supervisor:
+                    self.scope_var.set("personal")
+        hint_label = ttk.Label(frame, text="", foreground="#909399", font=("Microsoft YaHei", 8))
+        hint_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 5))
+        if not is_supervisor:
+            hint_label.configure(text="提示: 仅主管可创建共享方案")
         btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=2, column=0, columnspan=2, pady=20)
+        btn_frame.grid(row=3, column=0, columnspan=2, pady=15)
         ttk.Button(btn_frame, text="保存", command=self._on_ok, width=12).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="取消", command=self.destroy, width=12).pack(side="left", padx=5)
 
@@ -694,6 +705,7 @@ class MainApp(tk.Tk):
             self.deiconify()
             self._update_button_permissions()
             self._refresh_all()
+            self._restore_active_scheme()
         else:
             self.destroy()
 
@@ -742,6 +754,8 @@ class MainApp(tk.Tk):
         self.active_scheme_id = None
         self.active_scheme_label.configure(text="")
         self.scheme_combo.set("")
+        if self.current_user:
+            set_active_scheme_id(self.current_user["id"], None)
         self._refresh_borrow()
 
     def _refresh_borrower_combo(self):
@@ -763,7 +777,10 @@ class MainApp(tk.Tk):
         self._scheme_map = {}
         for s in schemes:
             scope_tag = "[共享]" if s["scope"] == "shared" else "[个人]"
-            label = f"{scope_tag} {s['name']}"
+            owner_hint = ""
+            if s["scope"] == "shared" and s.get("owner_name"):
+                owner_hint = f"({s['owner_name']})"
+            label = f"{scope_tag} {s['name']} {owner_hint}".strip()
             scheme_labels.append(label)
             self._scheme_map[label] = s["id"]
         self.scheme_combo.configure(values=scheme_labels)
@@ -778,8 +795,27 @@ class MainApp(tk.Tk):
                 self.active_scheme_id = None
                 self.active_scheme_label.configure(text="")
                 self.scheme_combo.set("")
+                set_active_scheme_id(self.current_user["id"], None)
         else:
             self.scheme_combo.set("")
+
+    def _restore_active_scheme(self):
+        if not self.current_user:
+            return
+        saved_id = get_active_scheme_id(self.current_user["id"])
+        if not saved_id:
+            return
+        scheme = get_filter_scheme_by_id(saved_id)
+        if not scheme:
+            set_active_scheme_id(self.current_user["id"], None)
+            return
+        self.active_scheme_id = saved_id
+        for lbl, sid in self._scheme_map.items():
+            if sid == saved_id:
+                self.scheme_var.set(lbl)
+                break
+        self.active_scheme_label.configure(text=f"当前方案: {scheme['name']}")
+        self._apply_scheme_filters(scheme)
 
     def _on_scheme_selected(self, event=None):
         pass
@@ -793,10 +829,15 @@ class MainApp(tk.Tk):
         scheme = get_filter_scheme_by_id(scheme_id)
         if not scheme:
             messagebox.showwarning("提示", "方案已被删除，将重置为默认视图", parent=self)
-            self.active_scheme_id = None
-            self.active_scheme_label.configure(text="")
-            self._reset_borrow_filter()
+            self._fallback_to_default()
             return
+        self.active_scheme_id = scheme_id
+        set_active_scheme_id(self.current_user["id"], scheme_id)
+        self.active_scheme_label.configure(text=f"当前方案: {scheme['name']}")
+        self._apply_scheme_filters(scheme)
+        self._refresh_borrow()
+
+    def _apply_scheme_filters(self, scheme):
         filters = scheme["filters"]
         status_val = filters.get("status", "")
         matched = False
@@ -825,9 +866,12 @@ class MainApp(tk.Tk):
         self.date_from_var.set(date_from_val)
         date_to_val = filters.get("date_to", "")
         self.date_to_var.set(date_to_val)
-        self.active_scheme_id = scheme_id
-        self.active_scheme_label.configure(text=f"当前方案: {scheme['name']}")
-        self._refresh_borrow()
+
+    def _fallback_to_default(self):
+        self.active_scheme_id = None
+        self.active_scheme_label.configure(text="")
+        set_active_scheme_id(self.current_user["id"], None)
+        self._reset_borrow_filter()
 
     def _save_scheme(self):
         if not self.current_user:
@@ -846,9 +890,11 @@ class MainApp(tk.Tk):
                     owner_id=self.current_user["id"],
                     filters=filters,
                     scope=dlg.result["scope"],
-                    scheme_id=dlg.result.get("scheme_id")
+                    scheme_id=dlg.result.get("scheme_id"),
+                    role=self.current_user["role"]
                 )
                 self.active_scheme_id = scheme_id
+                set_active_scheme_id(self.current_user["id"], scheme_id)
                 self._refresh_scheme_combo()
                 scheme = get_filter_scheme_by_id(scheme_id)
                 if scheme:
@@ -866,6 +912,8 @@ class MainApp(tk.Tk):
         scheme = get_filter_scheme_by_id(scheme_id)
         if not scheme:
             messagebox.showwarning("提示", "方案已不存在", parent=self)
+            if self.active_scheme_id == scheme_id:
+                self._fallback_to_default()
             self._refresh_scheme_combo()
             return
         if not messagebox.askyesno("确认", f"确定要删除方案「{scheme['name']}」吗？", parent=self):
@@ -873,9 +921,9 @@ class MainApp(tk.Tk):
         try:
             delete_filter_scheme(scheme_id, self.current_user["id"], self.current_user["role"])
             if self.active_scheme_id == scheme_id:
-                self.active_scheme_id = None
-                self.active_scheme_label.configure(text="")
+                self._fallback_to_default()
             self._refresh_scheme_combo()
+            self._refresh_borrow()
             messagebox.showinfo("成功", f"方案「{scheme['name']}」已删除", parent=self)
         except BusinessException as e:
             messagebox.showerror("删除失败", e.message, parent=self)

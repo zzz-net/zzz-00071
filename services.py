@@ -596,31 +596,82 @@ def _is_filter_empty(filters):
     return True
 
 
-def save_filter_scheme(name, owner_id, filters, scope="personal", scheme_id=None):
+def save_user_preference(user_id, pref_key, pref_value):
+    now = datetime.now().isoformat()
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO user_preferences (user_id, pref_key, pref_value, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, pref_key) DO UPDATE SET
+                pref_value = excluded.pref_value,
+                updated_at = excluded.updated_at
+        """, (user_id, pref_key, pref_value, now))
+
+
+def get_user_preference(user_id, pref_key):
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT pref_value FROM user_preferences WHERE user_id = ? AND pref_key = ?",
+            (user_id, pref_key)
+        ).fetchone()
+        return row["pref_value"] if row else None
+
+
+def set_active_scheme_id(user_id, scheme_id):
+    save_user_preference(user_id, "last_active_scheme_id",
+                         str(scheme_id) if scheme_id else "")
+
+
+def get_active_scheme_id(user_id):
+    val = get_user_preference(user_id, "last_active_scheme_id")
+    if val:
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def save_filter_scheme(name, owner_id, filters, scope="personal",
+                       scheme_id=None, role="operator"):
     if not name or not name.strip():
         raise BusinessException("方案名称不能为空")
     name = name.strip()
     if _is_filter_empty(filters):
         raise BusinessException("筛选条件不能全部为空")
+    if scope == "shared" and role != "supervisor":
+        raise BusinessException("仅主管可以创建共享方案")
     filters_json = _serialize_filters(filters)
     now = datetime.now().isoformat()
     with get_connection() as conn:
         if scheme_id:
-            existing = conn.execute("SELECT id, owner_id FROM filter_schemes WHERE id = ?",
+            existing = conn.execute("SELECT id, owner_id, scope FROM filter_schemes WHERE id = ?",
                                     (scheme_id,)).fetchone()
             if not existing:
                 raise BusinessException("方案不存在")
+            if existing["owner_id"] != owner_id:
+                raise BusinessException("只能更新自己创建的方案")
+            if scope == "shared" and existing["scope"] == "personal" and role != "supervisor":
+                raise BusinessException("仅主管可以将个人方案转为共享方案")
+            collision = conn.execute(
+                "SELECT id FROM filter_schemes WHERE name = ? AND id != ? "
+                "AND ((owner_id = ? AND scope = 'personal') OR scope = 'shared')",
+                (name, scheme_id, owner_id)
+            ).fetchone()
+            if collision:
+                raise BusinessException(f"同名方案已存在: {name}")
             conn.execute("""
                 UPDATE filter_schemes SET name=?, scope=?, filters=?, updated_at=? WHERE id=?
             """, (name, scope, filters_json, now, scheme_id))
             log_operation(conn, owner_id, "update_filter_scheme", "filter_scheme", scheme_id,
                           f"更新筛选方案: {name}")
             return scheme_id
-        existing = conn.execute(
-            "SELECT id FROM filter_schemes WHERE name = ? AND (owner_id = ? OR scope = 'shared')",
+        collision = conn.execute(
+            "SELECT id FROM filter_schemes WHERE name = ? "
+            "AND ((owner_id = ? AND scope = 'personal') OR scope = 'shared')",
             (name, owner_id)
         ).fetchone()
-        if existing:
+        if collision:
             raise BusinessException(f"同名方案已存在: {name}")
         cursor = conn.execute("""
             INSERT INTO filter_schemes (name, owner_id, scope, filters, created_at, updated_at)
@@ -634,18 +685,13 @@ def save_filter_scheme(name, owner_id, filters, scope="personal", scheme_id=None
 
 def get_filter_schemes(user_id, role):
     with get_connection() as conn:
-        if role == "supervisor":
-            rows = conn.execute("""
-                SELECT * FROM filter_schemes
-                WHERE owner_id = ? OR scope = 'shared'
-                ORDER BY scope DESC, name ASC
-            """, (user_id,)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT * FROM filter_schemes
-                WHERE owner_id = ? OR scope = 'shared'
-                ORDER BY scope DESC, name ASC
-            """, (user_id,)).fetchall()
+        rows = conn.execute("""
+            SELECT fs.*, u.display_name AS owner_name
+            FROM filter_schemes fs
+            JOIN users u ON fs.owner_id = u.id
+            WHERE fs.owner_id = ? OR fs.scope = 'shared'
+            ORDER BY fs.scope DESC, fs.name ASC
+        """, (user_id,)).fetchall()
         return [dict(row) for row in rows]
 
 
@@ -654,8 +700,15 @@ def delete_filter_scheme(scheme_id, user_id, role):
         scheme = conn.execute("SELECT * FROM filter_schemes WHERE id = ?", (scheme_id,)).fetchone()
         if not scheme:
             raise BusinessException("方案不存在")
-        if scheme["owner_id"] != user_id and role != "supervisor":
-            raise BusinessException("只能删除自己创建的方案")
+        if scheme["owner_id"] == user_id:
+            pass
+        elif scheme["scope"] == "shared" and role == "supervisor":
+            pass
+        else:
+            if scheme["scope"] == "personal":
+                raise BusinessException("不能删除他人的个人方案")
+            else:
+                raise BusinessException("只有主管可以删除共享方案")
         conn.execute("DELETE FROM filter_schemes WHERE id = ?", (scheme_id,))
         log_operation(conn, user_id, "delete_filter_scheme", "filter_scheme", scheme_id,
                       f"删除筛选方案: {scheme['name']}")
