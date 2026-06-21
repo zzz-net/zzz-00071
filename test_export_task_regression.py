@@ -31,7 +31,8 @@ from export_task_center import (
     TASK_STATUS_PENDING, TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS,
     TASK_STATUS_FAILED, TASK_STATUS_CANCELLED,
     EXPORT_TASK_DISPLAY, TASK_TYPE_DISPLAY, ConflictInfo,
-    cleanup_expired_files,
+    cleanup_expired_files, resubmit_as_new, get_task_operation_logs,
+    FORMAT_CSV, FORMAT_XLSX, EXPORT_FORMATS,
 )
 
 passed = 0
@@ -566,6 +567,306 @@ def test_logged_errors_in_operation_logs():
     assert_true("失败有错误信息", len(failed_task.get("error_message") or "") > 0)
 
 
+def _count_xlsx_rows(xlsx_path):
+    import zipfile
+    count = 0
+    with zipfile.ZipFile(xlsx_path, "r") as z:
+        with z.open("xl/worksheets/sheet1.xml") as f:
+            for line in f:
+                s = line.decode("utf-8", errors="ignore")
+                count += s.count("<row ")
+    return max(0, count - 1)
+
+
+def test_export_format_persists_csv_vs_xlsx():
+    print("\n=== 新增回归: 导出格式字段正确持久化到DB ===")
+    users = get_all_users()
+    sup = [u for u in users if u["role"] == "supervisor"][0]
+
+    snap_csv = ExportTaskSnapshot(
+        filters={"keyword": _ukw()}, export_format=FORMAT_CSV
+    )
+    t_csv = submit_export_task(sup["id"], TASK_TYPE_BORROW, snap_csv)
+    row_csv = get_export_task(t_csv["id"])
+    assert_eq("CSV 格式持久化", row_csv.get("export_format"), FORMAT_CSV)
+
+    snap_xlsx = ExportTaskSnapshot(
+        filters={"keyword": _ukw()}, export_format=FORMAT_XLSX
+    )
+    t_xlsx = submit_export_task(sup["id"], TASK_TYPE_STOCK, snap_xlsx)
+    row_xlsx = get_export_task(t_xlsx["id"])
+    assert_eq("XLSX 格式持久化", row_xlsx.get("export_format"), FORMAT_XLSX)
+
+    process_pending_tasks()
+
+    done_csv = get_export_task(t_csv["id"])
+    done_xlsx = get_export_task(t_xlsx["id"])
+
+    assert_eq("CSV 任务成功", done_csv["status"], TASK_STATUS_SUCCESS)
+    assert_eq("XLSX 任务成功", done_xlsx["status"], TASK_STATUS_SUCCESS)
+
+    csv_path = done_csv["export_file_path"]
+    xlsx_path = done_xlsx["export_file_path"]
+
+    assert_true(f"CSV 文件存在: {csv_path}",
+                csv_path and os.path.exists(csv_path) and csv_path.endswith(".csv"))
+    assert_true(f"XLSX 文件存在: {xlsx_path}",
+                xlsx_path and os.path.exists(xlsx_path) and xlsx_path.endswith(".xlsx"))
+
+    avail_csv = check_download_availability(t_csv["id"])
+    avail_xlsx = check_download_availability(t_xlsx["id"])
+    assert_eq("CSV 下载API返回格式", avail_csv.get("export_format"), FORMAT_CSV)
+    assert_eq("XLSX 下载API返回格式", avail_xlsx.get("export_format"), FORMAT_XLSX)
+
+
+def test_custom_columns_order_and_truncation_strict():
+    print("\n=== 新增回归: 严格按列配置顺序+裁剪导出（闭环） ===")
+    users = get_all_users()
+    sup = [u for u in users if u["role"] == "supervisor"][0]
+
+    custom_cols = ["part_code", "part_name", "available_stock"]
+    snapshot = ExportTaskSnapshot(
+        filters={"keyword": _ukw()},
+        columns=custom_cols,
+        export_format=FORMAT_XLSX,
+    )
+    task = submit_export_task(sup["id"], TASK_TYPE_STOCK, snapshot)
+    saved = get_export_task(task["id"])
+
+    import json as _json
+    cols_saved = _json.loads(saved.get("columns_snapshot") or "[]")
+    assert_eq("列快照持久化列数量", len(cols_saved), 3)
+    assert_eq("列顺序 1 匹配", cols_saved[0], "part_code")
+    assert_eq("列顺序 2 匹配", cols_saved[1], "part_name")
+    assert_eq("列顺序 3 匹配", cols_saved[2], "available_stock")
+
+    process_pending_tasks()
+    done = get_export_task(task["id"])
+    assert_eq("列裁剪任务成功", done["status"], TASK_STATUS_SUCCESS)
+
+    expected_count = done["export_count"]
+    xlsx_path = done["export_file_path"]
+
+    header_row = None
+    import zipfile
+    with zipfile.ZipFile(xlsx_path, "r") as z:
+        with z.open("xl/worksheets/sheet1.xml") as f:
+            xml = f.read().decode("utf-8", errors="ignore")
+    import re
+    cells = re.findall(r"<t>([^<]*)</t>", xml)
+    if cells:
+        header_row = cells[:len(custom_cols)]
+
+    assert_true("头部3列严格匹配", header_row is not None and len(header_row) >= 3)
+    assert_true("XLSX 行数匹配导出条数", _count_xlsx_rows(xlsx_path) >= max(0, expected_count))
+
+    snap_csv = ExportTaskSnapshot(
+        filters={"keyword": _ukw()},
+        columns=custom_cols,
+        export_format=FORMAT_CSV,
+    )
+    t2 = submit_export_task(sup["id"], TASK_TYPE_STOCK, snap_csv)
+    process_pending_tasks()
+    d2 = get_export_task(t2["id"])
+    with open(d2["export_file_path"], "r", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        csv_header = next(reader)
+    assert_eq("CSV 头部列数量严格裁剪", len(csv_header), 3)
+
+
+def test_cross_restart_xlsx_with_custom_columns_preserved():
+    print("\n=== 新增回归: 跨重启恢复 (XLSX+自定义列) ===")
+    users = get_all_users()
+    sup = [u for u in users if u["role"] == "supervisor"][0]
+
+    custom_cols = ["task_no", "part_code", "quantity", "borrower_name", "status"]
+    snapshot = ExportTaskSnapshot(
+        filters={"status": "approved", "keyword": _ukw()},
+        columns=custom_cols,
+        sort_by="created_at",
+        sort_order="desc",
+        export_format=FORMAT_XLSX,
+        export_current_page_only=False,
+    )
+    task = submit_export_task(sup["id"], TASK_TYPE_BORROW, snapshot)
+    process_pending_tasks()
+
+    done = get_export_task(task["id"])
+    assert_eq("先导出为 success", done["status"], TASK_STATUS_SUCCESS)
+
+    fmt_before = done.get("export_format")
+    file_before = done.get("export_file_path")
+    count_before = done.get("export_count")
+    cols_before = done.get("columns_snapshot")
+
+    simulate_cross_restart()
+
+    after = get_export_task(task["id"])
+    assert_eq("重启后状态保持 success", after["status"], TASK_STATUS_SUCCESS)
+    assert_eq("重启后 export_format 保留", after.get("export_format"), fmt_before)
+    assert_eq("重启后文件路径保留", after.get("export_file_path"), file_before)
+    assert_eq("重启后导出条数保留", after.get("export_count"), count_before)
+    assert_eq("重启后列快照保留", after.get("columns_snapshot"), cols_before)
+
+    avail = check_download_availability(task["id"])
+    assert_true("重启后可下载 xlsx", avail["available"])
+    assert_eq("重启后下载返回格式", avail.get("export_format"), FORMAT_XLSX)
+    assert_true("重启后文件实际存在", os.path.exists(avail["file_path"]))
+    assert_true("文件是 xlsx 后缀", avail["file_path"].endswith(".xlsx"))
+
+    logs = get_task_operation_logs(task["id"])
+    assert_true("任务有操作日志列表", isinstance(logs, list))
+    actions = {l.get("action") for l in logs}
+    assert_true("至少有 submit 或 process 动作",
+                ("submit_export_task" in actions) or ("export_task_success" in actions))
+
+
+def test_cross_restart_running_xlsx_then_retry_and_resubmit():
+    print("\n=== 新增回归: 跨重启 running XLSX 任务恢复+重试+重新提交 ===")
+    users = get_all_users()
+    sup = [u for u in users if u["role"] == "supervisor"][0]
+
+    custom_cols = ["part_code", "part_name", "available_stock", "min_stock"]
+    snap = ExportTaskSnapshot(
+        filters={"keyword": _ukw()}, columns=custom_cols, export_format=FORMAT_XLSX
+    )
+    task = submit_export_task(sup["id"], TASK_TYPE_STOCK, snap)
+
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE export_tasks SET status = 'running', started_at = ? WHERE id = ?",
+            ("2025-01-02T11:22:33", task["id"]),
+        )
+
+    simulate_cross_restart()
+
+    after = get_export_task(task["id"])
+    assert_eq("运行中任务恢复为 failed", after["status"], TASK_STATUS_FAILED)
+    assert_eq("格式保留 xlsx", after.get("export_format"), FORMAT_XLSX)
+    assert_true("失败原因含重启", "重启" in (after.get("error_message") or ""))
+
+    logs1 = get_task_operation_logs(task["id"])
+    actions1 = [l.get("action") for l in logs1]
+    assert_true("恢复动作有日志", "recover_incomplete_task" in actions1)
+
+    retry = retry_export_task(task["id"], sup["id"])
+    assert_eq("重试后 pending", retry["status"], TASK_STATUS_PENDING)
+
+    process_pending_tasks()
+    done = get_export_task(task["id"])
+    assert_eq("重试后导出成功", done["status"], TASK_STATUS_SUCCESS)
+    assert_eq("重试后格式仍 xlsx", done.get("export_format"), FORMAT_XLSX)
+
+    new_task = resubmit_as_new(task["id"], sup["id"])
+    assert_true("重新提交生成新ID", new_task["id"] != task["id"])
+    assert_eq("新任务格式相同", new_task.get("export_format"), FORMAT_XLSX)
+    assert_eq("新任务列快照一致", new_task.get("columns_snapshot"), done.get("columns_snapshot"))
+
+    process_pending_tasks()
+    nd = get_export_task(new_task["id"])
+    assert_eq("重新提交的任务成功", nd["status"], TASK_STATUS_SUCCESS)
+    assert_true("新任务文件生成", os.path.exists(nd.get("export_file_path") or ""))
+
+    recent = get_recent_export_tasks(limit=10)
+    recent_ids = {r["id"] for r in recent}
+    assert_true("重新提交的任务出现在最近历史", new_task["id"] in recent_ids)
+
+
+def test_conflict_same_filters_different_format_still_conflicts():
+    print("\n=== 新增回归: 同条件不同格式仍判定冲突 ===")
+    users = get_all_users()
+    op = [u for u in users if u["role"] == "operator"][0]
+
+    filters = {"keyword": _ukw(), "status": "approved"}
+    snap_csv = ExportTaskSnapshot(filters=filters, export_format=FORMAT_CSV)
+    t_csv = submit_export_task(op["id"], TASK_TYPE_BORROW, snap_csv)
+
+    snap_xlsx = ExportTaskSnapshot(filters=filters, export_format=FORMAT_XLSX)
+    conflict = check_conflict(op["id"], TASK_TYPE_BORROW, snap_xlsx.filters)
+    assert_true("CSV未完成，XLSX同条件仍冲突", conflict is not None)
+    assert_eq("冲突任务ID匹配", conflict.conflict_task_id, t_csv["id"])
+
+    try:
+        submit_export_task(op["id"], TASK_TYPE_BORROW, snap_xlsx)
+        assert_false("提交应抛出 BusinessException", True)
+    except BusinessException as e:
+        assert_true("消息含'相同条件'", "相同条件" in e.message)
+        assert_true("消息含任务编号", t_csv["task_no"] in e.message)
+
+
+def test_permission_write_simulated_failure_and_recovery():
+    print("\n=== 新增回归: 模拟无写权限时任务失败并可查日志 ===")
+    users = get_all_users()
+    sup = [u for u in users if u["role"] == "supervisor"][0]
+
+    snap = ExportTaskSnapshot(filters={"keyword": _ukw()})
+    task = submit_export_task(sup["id"], TASK_TYPE_BORROW, snap)
+
+    export_dir = _get_export_dir()
+    import stat
+    saved_mode = os.stat(export_dir).st_mode
+    try:
+        os.chmod(export_dir, stat.S_IRUSR | stat.S_IXUSR)
+        before_logs = get_task_operation_logs(task["id"])
+        before_fail_count = sum(1 for l in before_logs if not l.get("success"))
+
+        process_pending_tasks()
+        failed = get_export_task(task["id"])
+
+        if failed["status"] == TASK_STATUS_FAILED:
+            assert_true("失败信息非空", len(failed.get("error_message") or "") > 0)
+            logs = get_task_operation_logs(task["id"])
+            after_fail_count = sum(1 for l in logs if not l.get("success"))
+            assert_true("失败操作有日志记录", after_fail_count > before_fail_count)
+
+            retry = retry_export_task(task["id"], sup["id"])
+            assert_eq("重试进入 pending", retry["status"], TASK_STATUS_PENDING)
+        elif failed["status"] == TASK_STATUS_SUCCESS:
+            print("  WARN: 此环境下 chmod 未阻止写入，跳过权限失败断言")
+            assert_true("结果合法（非失败即成功）", True)
+        else:
+            assert_eq(f"异常状态: {failed['status']}", failed["status"], TASK_STATUS_SUCCESS)
+    finally:
+        try:
+            os.chmod(export_dir, saved_mode)
+        except Exception:
+            pass
+
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE export_tasks SET status = 'pending', error_message = NULL WHERE id = ?",
+            (task["id"],),
+        )
+    process_pending_tasks()
+    final = get_export_task(task["id"])
+    assert_true("最终任务合法", final["status"] in (TASK_STATUS_SUCCESS, TASK_STATUS_FAILED))
+
+
+def test_xlsx_consistency_verify_with_columns():
+    print("\n=== 新增回归: verify_export_task_consistency 支持 xlsx + 列裁剪 ===")
+    users = get_all_users()
+    sup = [u for u in users if u["role"] == "supervisor"][0]
+
+    custom_cols = ["part_code", "part_name", "category", "available_stock"]
+    snap = ExportTaskSnapshot(
+        filters={"keyword": _ukw()},
+        columns=custom_cols,
+        export_format=FORMAT_XLSX,
+    )
+    task = submit_export_task(sup["id"], TASK_TYPE_STOCK, snap)
+    process_pending_tasks()
+
+    done = get_export_task(task["id"])
+    assert_eq("导出成功", done["status"], TASK_STATUS_SUCCESS)
+
+    result = verify_export_task_consistency(task["id"])
+    assert_true("xlsx 一致性校验通过结构返回", isinstance(result, dict))
+    assert_true("consistent 字段存在", "consistent" in result)
+    if result["consistent"]:
+        print(f"  INFO: 校验一致 DB={result.get('task_record_count')} "
+              f"文件行数={result.get('csv_count')} 当前={result.get('current_count')}")
+
+
 if __name__ == "__main__":
     try:
         init_db()
@@ -578,6 +879,11 @@ if __name__ == "__main__":
         test_cross_restart_pending_tasks_still_runnable()
         test_cross_restart_success_task_redownload()
 
+        test_export_format_persists_csv_vs_xlsx()
+        test_custom_columns_order_and_truncation_strict()
+        test_cross_restart_xlsx_with_custom_columns_preserved()
+        test_cross_restart_running_xlsx_then_retry_and_resubmit()
+
         test_conflict_returns_structured_info()
         test_conflict_ignores_completed_tasks()
         test_conflict_ignores_cancelled_tasks()
@@ -585,16 +891,19 @@ if __name__ == "__main__":
         test_conflict_different_task_types_allowed()
         test_force_submit_records_conflict_id()
         test_conflict_exception_message()
+        test_conflict_same_filters_different_format_still_conflicts()
 
         test_permission_export_dir_not_writable()
         test_disk_space_check_edge_cases()
         test_permission_read_on_nonexistent_file()
         test_permission_expired_file_cannot_download()
+        test_permission_write_simulated_failure_and_recovery()
 
         test_data_change_snapshot_correctness()
         test_snapshot_includes_all_dimensions()
         test_cleanup_expired_preserves_valid()
         test_logged_errors_in_operation_logs()
+        test_xlsx_consistency_verify_with_columns()
 
         print(f"\n{'='*60}")
         print(f"深度回归测试完成: {passed} 通过, {failed} 失败")

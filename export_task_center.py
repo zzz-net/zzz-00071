@@ -5,6 +5,9 @@ import logging
 import os
 import shutil
 import threading
+import zipfile
+from io import BytesIO
+from xml.sax.saxutils import escape
 from datetime import datetime, timedelta
 from database import get_connection, DB_PATH
 from services import (
@@ -18,6 +21,11 @@ logger = logging.getLogger(__name__)
 EXPORT_DIR_NAME = "exports"
 FILE_EXPIRE_DAYS = 7
 MAX_CONCURRENT_TASKS = 1
+
+FORMAT_CSV = "csv"
+FORMAT_XLSX = "xlsx"
+EXPORT_FORMATS = (FORMAT_CSV, FORMAT_XLSX)
+FORMAT_DISPLAY = {FORMAT_CSV: "CSV", FORMAT_XLSX: "Excel"}
 
 TASK_STATUS_PENDING = "pending"
 TASK_STATUS_RUNNING = "running"
@@ -42,6 +50,82 @@ TASK_TYPE_DISPLAY = {
     TASK_TYPE_STOCK: "库存明细",
     TASK_TYPE_STOCK_LOG: "库存变动",
 }
+
+BORROW_COLUMN_MAP = {
+    "record_no": ("记录编号", "record_no"),
+    "part_code": ("备件编码", "part_code"),
+    "part_name": ("备件名称", "part_name"),
+    "quantity": ("借用数量", "quantity"),
+    "unit": ("单位", "unit"),
+    "unit_price": ("单价(元)", "unit_price"),
+    "total_amount": ("总金额(元)", "_total"),
+    "borrower": ("借用人", "borrower_name"),
+    "borrower_name": ("借用人", "borrower_name"),
+    "purpose": ("用途", "purpose"),
+    "status": ("状态", "status"),
+    "approver": ("审批人", "approver_name"),
+    "approver_name": ("审批人", "approver_name"),
+    "approval_remark": ("审批备注", "approval_remark"),
+    "approval_at": ("审批时间", "approval_at"),
+    "borrow_at": ("借出时间", "borrow_at"),
+    "return_qty": ("已归还数量", "return_quantity"),
+    "return_quantity": ("已归还数量", "return_quantity"),
+    "return_at": ("归还时间", "return_at"),
+    "return_remark": ("归还备注", "return_remark"),
+    "created_at": ("创建时间", "created_at"),
+}
+
+STOCK_COLUMN_MAP = {
+    "part_code": ("备件编码", "part_code"),
+    "part_name": ("备件名称", "part_name"),
+    "category": ("分类", "category"),
+    "specification": ("规格型号", "specification"),
+    "unit": ("单位", "unit"),
+    "unit_price": ("单价(元)", "unit_price"),
+    "approval": ("是否需审批", "requires_approval"),
+    "requires_approval": ("是否需审批", "requires_approval"),
+    "approval_threshold": ("审批阈值(元)", "approval_threshold"),
+    "available": ("可用库存", "available_stock"),
+    "available_stock": ("可用库存", "available_stock"),
+    "pending": ("待审批数量", "pending_count"),
+    "pending_count": ("待审批数量", "pending_count"),
+    "borrowed": ("已借出数量", "borrowed_count"),
+    "borrowed_count": ("已借出数量", "borrowed_count"),
+    "total": ("总库存", "total_stock"),
+    "total_stock": ("总库存", "total_stock"),
+    "status": ("库存状态", "_status"),
+}
+
+STOCK_LOG_COLUMN_MAP = {
+    "id": ("日志ID", "id"),
+    "part_code": ("备件编码", "part_code"),
+    "part_name": ("备件名称", "part_name"),
+    "operation_type": ("操作类型", "operation_type"),
+    "quantity_change": ("库存变动", "quantity_change"),
+    "before_available": ("变动前可用", "before_available"),
+    "after_available": ("变动后可用", "after_available"),
+    "operator_name": ("操作人", "operator_name"),
+    "remark": ("备注", "remark"),
+    "created_at": ("操作时间", "created_at"),
+}
+
+BORROW_DEFAULT_COLUMNS = [
+    "record_no", "part_code", "part_name", "quantity", "unit",
+    "unit_price", "total_amount", "borrower", "purpose", "status",
+    "approver", "approval_remark", "approval_at", "borrow_at",
+    "return_qty", "return_at", "return_remark", "created_at"
+]
+
+STOCK_DEFAULT_COLUMNS = [
+    "part_code", "part_name", "category", "specification", "unit",
+    "unit_price", "approval", "approval_threshold", "total",
+    "available", "pending", "borrowed", "status"
+]
+
+STOCK_LOG_DEFAULT_COLUMNS = [
+    "id", "part_code", "part_name", "operation_type", "quantity_change",
+    "before_available", "after_available", "operator_name", "remark", "created_at"
+]
 
 
 def _get_export_dir():
@@ -87,13 +171,16 @@ def _check_write_permission(export_dir):
 
 class ExportTaskSnapshot:
     def __init__(self, filters=None, sort_by=None, sort_order=None,
-                 page=None, page_size=None, columns=None):
+                 page=None, page_size=None, columns=None,
+                 export_format=FORMAT_CSV, export_current_page_only=False):
         self.filters = filters or {}
         self.sort_by = sort_by
         self.sort_order = sort_order
         self.page = page
         self.page_size = page_size
         self.columns = columns or []
+        self.export_format = export_format if export_format in EXPORT_FORMATS else FORMAT_CSV
+        self.export_current_page_only = bool(export_current_page_only)
 
     def to_dict(self):
         d = {}
@@ -109,6 +196,8 @@ class ExportTaskSnapshot:
             d["page_size"] = self.page_size
         if self.columns:
             d["columns"] = self.columns
+        d["export_format"] = self.export_format
+        d["export_current_page_only"] = self.export_current_page_only
         return d
 
     @classmethod
@@ -122,6 +211,8 @@ class ExportTaskSnapshot:
             page=data.get("page"),
             page_size=data.get("page_size"),
             columns=data.get("columns", []),
+            export_format=data.get("export_format", FORMAT_CSV),
+            export_current_page_only=data.get("export_current_page_only", False),
         )
 
 
@@ -183,12 +274,18 @@ def submit_export_task(user_id, task_type, snapshot, force=False):
     if not snapshot or not isinstance(snapshot, ExportTaskSnapshot):
         raise BusinessException("任务快照不能为空")
 
+    fmt = snapshot.export_format
+    if fmt not in EXPORT_FORMATS:
+        raise BusinessException(f"不支持的导出格式: {fmt}")
+
     filters_json = json.dumps(snapshot.filters, ensure_ascii=False)
-    sort_json = json.dumps(snapshot.to_dict().get("sort_by") and {
-        "sort_by": snapshot.sort_by, "sort_order": snapshot.sort_order
-    }, ensure_ascii=False) if snapshot.sort_by else ""
-    page_json = json.dumps({"page": snapshot.page, "page_size": snapshot.page_size},
-                           ensure_ascii=False) if snapshot.page is not None else ""
+    sort_json = json.dumps({"sort_by": snapshot.sort_by, "sort_order": snapshot.sort_order},
+                           ensure_ascii=False) if snapshot.sort_by else ""
+    page_json = json.dumps({
+        "page": snapshot.page,
+        "page_size": snapshot.page_size,
+        "export_current_page_only": snapshot.export_current_page_only,
+    }, ensure_ascii=False) if snapshot.page is not None else ""
     columns_json = json.dumps(snapshot.columns, ensure_ascii=False) if snapshot.columns else ""
 
     conflict = check_conflict(user_id, task_type, filters_json)
@@ -204,7 +301,10 @@ def submit_export_task(user_id, task_type, snapshot, force=False):
     if not ok:
         raise BusinessException(err)
 
-    ok, err = _check_disk_space(export_dir, record_count * 500)
+    est_bytes = record_count * 500
+    if fmt == FORMAT_XLSX:
+        est_bytes = int(est_bytes * 1.3)
+    ok, err = _check_disk_space(export_dir, est_bytes)
     if not ok:
         raise BusinessException(err)
 
@@ -217,13 +317,13 @@ def submit_export_task(user_id, task_type, snapshot, force=False):
     with get_connection() as conn:
         cursor = conn.execute("""
             INSERT INTO export_tasks (
-                task_no, user_id, task_type, status,
+                task_no, user_id, task_type, status, export_format,
                 filters_snapshot, sort_snapshot, page_snapshot, columns_snapshot,
                 record_count, data_fingerprint, conflict_task_id,
                 created_at, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            task_no, user_id, task_type, TASK_STATUS_PENDING,
+            task_no, user_id, task_type, TASK_STATUS_PENDING, fmt,
             filters_json, sort_json, page_json, columns_json,
             record_count, data_fingerprint, conflict_task_id,
             now, expires_at
@@ -236,7 +336,7 @@ def submit_export_task(user_id, task_type, snapshot, force=False):
             """, (TASK_STATUS_CANCELLED, now, conflict.conflict_task_id))
 
         _log_task_operation(conn, user_id, "submit_export_task", task_id,
-                            f"提交导出任务 {task_no}, 类型={TASK_TYPE_DISPLAY.get(task_type, task_type)}, 预计{record_count}条")
+                            f"提交导出任务 {task_no}, 类型={TASK_TYPE_DISPLAY.get(task_type, task_type)}, 格式={FORMAT_DISPLAY.get(fmt, fmt)}, 预计{record_count}条")
 
     return get_export_task(task_id)
 
@@ -252,6 +352,231 @@ def _query_records_for_task(task_type, filters):
         part_id = filters.get("part_id")
         return get_stock_logs(part_id=part_id, limit=5000)
     return []
+
+
+def _apply_sort(records, sort_by, sort_order, column_map):
+    if not sort_by or not records:
+        return records
+    mapped = column_map.get(sort_by, (None, sort_by))
+    sort_key_field = mapped[1]
+    if not sort_key_field:
+        return records
+
+    def _key(r):
+        val = r.get(sort_key_field, "")
+        if val is None:
+            val = ""
+        return val
+
+    reverse = (sort_order == "desc")
+    try:
+        return sorted(records, key=_key, reverse=reverse)
+    except Exception:
+        return records
+
+
+def _apply_page(records, page, page_size, current_page_only):
+    if not current_page_only or page is None or page_size is None:
+        return records
+    if page <= 0 or page_size <= 0:
+        return records
+    start = (page - 1) * page_size
+    end = start + page_size
+    return records[start:end]
+
+
+def _resolve_columns(col_keys, column_map, default_cols):
+    resolved = []
+    used_keys = set()
+    if col_keys:
+        for k in col_keys:
+            if k in column_map:
+                header, field = column_map[k]
+                if k not in used_keys:
+                    resolved.append((k, header, field))
+                    used_keys.add(k)
+    if not resolved:
+        for k in default_cols:
+            if k in column_map:
+                header, field = column_map[k]
+                resolved.append((k, header, field))
+    return resolved
+
+
+def _transform_borrow_row(r):
+    total_amount = r.get("quantity", 0) * r.get("unit_price", 0)
+    status_text = STATUS_DISPLAY.get(r.get("status", ""), (r.get("status", ""), ""))[0]
+    transformed = dict(r)
+    transformed["_total"] = total_amount
+    transformed["status"] = status_text
+    for k in list(transformed.keys()):
+        if transformed[k] is None:
+            transformed[k] = ""
+    return transformed
+
+
+def _transform_stock_row(p):
+    approval_flag = "是" if p.get("requires_approval") else "否"
+    available = p.get("available_stock", 0) or 0
+    pending = p.get("pending_count", 0) or 0
+    borrowed = p.get("borrowed_count", 0) or 0
+    if available > 0:
+        stock_status = f"可借 ({available})"
+    elif pending > 0:
+        stock_status = "待审批"
+    elif borrowed > 0:
+        stock_status = "已借空"
+    else:
+        stock_status = "无库存"
+    transformed = dict(p)
+    transformed["requires_approval"] = approval_flag
+    transformed["_status"] = stock_status
+    for k in list(transformed.keys()):
+        if transformed[k] is None:
+            transformed[k] = ""
+    return transformed
+
+
+def _transform_stock_log_row(log):
+    op_text = OPERATION_DISPLAY.get(log.get("operation_type", ""), (log.get("operation_type", ""), ""))[0]
+    change = f"{log.get('quantity_change', 0):+d}"
+    transformed = dict(log)
+    transformed["operation_type"] = op_text
+    transformed["quantity_change"] = change
+    for k in list(transformed.keys()):
+        if transformed[k] is None:
+            transformed[k] = ""
+    return transformed
+
+
+def _format_cell_value(val, field_key):
+    if val is None:
+        return ""
+    if field_key in ("unit_price", "approval_threshold", "_total"):
+        try:
+            return f"{float(val):.2f}"
+        except (ValueError, TypeError):
+            return str(val)
+    if field_key in ("quantity", "available_stock", "pending_count", "borrowed_count",
+                     "total_stock", "return_quantity", "before_available", "after_available",
+                     "id", "part_id", "record_id"):
+        try:
+            return str(int(val))
+        except (ValueError, TypeError):
+            return str(val)
+    return str(val)
+
+
+def _write_csv_file(file_path, headers, rows):
+    with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        for row in rows:
+            writer.writerow(row)
+
+
+def _write_xlsx_file(file_path, headers, rows):
+    content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+  <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+</Types>'''
+
+    rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>
+</Relationships>'''
+
+    workbook = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="Sheet1" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>'''
+
+    wb_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>'''
+
+    styles = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="2">
+    <font><sz val="11"/><name val="Calibri"/></font>
+    <font><b/><sz val="11"/><name val="Calibri"/></font>
+  </fonts>
+  <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+  <borders count="1"><border/></borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0"/></cellStyleXfs>
+  <cellXfs count="2">
+    <xf numFmtId="0" fontId="0" applyFont="1"/>
+    <xf numFmtId="0" fontId="1" applyFont="1"/>
+  </cellXfs>
+  <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+</styleSheet>'''
+
+    now_str = datetime.now().isoformat()
+    core = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <dc:creator>ExportTaskCenter</dc:creator>
+  <cp:lastModifiedBy>ExportTaskCenter</cp:lastModifiedBy>
+  <dcterms:created xsi:type="dcterms:W3CDTF">{now_str}</dcterms:created>
+  <dcterms:modified xsi:type="dcterms:W3CDTF">{now_str}</dcterms:modified>
+</cp:coreProperties>'''
+
+    def col_letter(idx):
+        s = ""
+        while idx > 0:
+            idx, r = divmod(idx - 1, 26)
+            s = chr(65 + r) + s
+        return s
+
+    def cell_ref(col, row):
+        return f"{col_letter(col)}{row}"
+
+    sheet_buf = BytesIO()
+    sheet_buf.write(b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>''')
+
+    def write_xml_row(row_idx, values, style=0):
+        sheet_buf.write(f'<row r="{row_idx}">'.encode("utf-8"))
+        for col_idx, v in enumerate(values, 1):
+            ref = cell_ref(col_idx, row_idx)
+            v_str = "" if v is None else str(v)
+            escaped = escape(v_str)
+            is_number = False
+            if style == 0 and v_str != "":
+                try:
+                    float(v_str)
+                    is_number = True
+                except ValueError:
+                    pass
+            if is_number:
+                sheet_buf.write(f'<c r="{ref}" s="{style}"><v>{escaped}</v></c>'.encode("utf-8"))
+            else:
+                sheet_buf.write(f'<c r="{ref}" t="inlineStr" s="{style}"><is><t>{escaped}</t></is></c>'.encode("utf-8"))
+        sheet_buf.write(b'</row>')
+
+    write_xml_row(1, headers, style=1)
+    for i, row in enumerate(rows, 2):
+        write_xml_row(i, row)
+
+    sheet_buf.write(b'</sheetData></worksheet>')
+
+    with zipfile.ZipFile(file_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", rels)
+        zf.writestr("docProps/core.xml", core)
+        zf.writestr("xl/workbook.xml", workbook)
+        zf.writestr("xl/_rels/workbook.xml.rels", wb_rels)
+        zf.writestr("xl/styles.xml", styles)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet_buf.getvalue().decode("utf-8"))
 
 
 def _execute_export(task_id):
@@ -276,7 +601,11 @@ def _execute_export(task_id):
             _mark_task_failed(task_id, task["user_id"], err)
             return
 
-        ok, err = _check_disk_space(export_dir, task["record_count"] * 500)
+        fmt = task.get("export_format", FORMAT_CSV)
+        est_bytes = task["record_count"] * 500
+        if fmt == FORMAT_XLSX:
+            est_bytes = int(est_bytes * 1.3)
+        ok, err = _check_disk_space(export_dir, est_bytes)
         if not ok:
             _mark_task_failed(task_id, task["user_id"], err)
             return
@@ -290,21 +619,76 @@ def _execute_export(task_id):
                               f"源数据已变化（提交时 {task['record_count']} 条，当前 {len(current_records)} 条），请重新提交任务")
             return
 
-        task_type = task["task_type"]
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{TASK_TYPE_DISPLAY.get(task_type, task_type)}_{timestamp}.csv"
-        file_path = os.path.join(export_dir, filename)
+        sort_by = None
+        sort_order = "asc"
+        if task.get("sort_snapshot"):
+            try:
+                sort_data = json.loads(task["sort_snapshot"])
+                sort_by = sort_data.get("sort_by")
+                sort_order = sort_data.get("sort_order", "asc")
+            except (json.JSONDecodeError, TypeError):
+                pass
 
+        page = None
+        page_size = None
+        current_page_only = False
+        if task.get("page_snapshot"):
+            try:
+                page_data = json.loads(task["page_snapshot"])
+                page = page_data.get("page")
+                page_size = page_data.get("page_size")
+                current_page_only = page_data.get("export_current_page_only", False)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        col_keys = []
+        if task.get("columns_snapshot"):
+            try:
+                col_keys = json.loads(task["columns_snapshot"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        task_type = task["task_type"]
         if task_type == TASK_TYPE_BORROW:
-            export_count = _write_borrow_csv(file_path, current_records)
+            col_map = BORROW_COLUMN_MAP
+            default_cols = BORROW_DEFAULT_COLUMNS
+            transformed = [_transform_borrow_row(r) for r in current_records]
         elif task_type == TASK_TYPE_STOCK:
-            export_count = _write_stock_csv(file_path, current_records)
+            col_map = STOCK_COLUMN_MAP
+            default_cols = STOCK_DEFAULT_COLUMNS
+            transformed = [_transform_stock_row(r) for r in current_records]
         elif task_type == TASK_TYPE_STOCK_LOG:
-            export_count = _write_stock_log_csv(file_path, current_records)
+            col_map = STOCK_LOG_COLUMN_MAP
+            default_cols = STOCK_LOG_DEFAULT_COLUMNS
+            transformed = [_transform_stock_log_row(r) for r in current_records]
         else:
             _mark_task_failed(task_id, task["user_id"], f"不支持的任务类型: {task_type}")
             return
 
+        sorted_records = _apply_sort(transformed, sort_by, sort_order, col_map)
+        paged_records = _apply_page(sorted_records, page, page_size, current_page_only)
+        resolved_cols = _resolve_columns(col_keys, col_map, default_cols)
+
+        headers = [h for _, h, _ in resolved_cols]
+        output_rows = []
+        for r in paged_records:
+            row = []
+            for _, _, field_key in resolved_cols:
+                raw_val = r.get(field_key, "")
+                row.append(_format_cell_value(raw_val, field_key))
+            output_rows.append(row)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ext = "xlsx" if fmt == FORMAT_XLSX else "csv"
+        filename = f"{TASK_TYPE_DISPLAY.get(task_type, task_type)}_{timestamp}.{ext}"
+        file_path = os.path.join(export_dir, filename)
+
+        if fmt == FORMAT_XLSX:
+            _write_xlsx_file(file_path, headers, output_rows)
+        else:
+            _write_csv_file(file_path, headers, output_rows)
+
+        export_count = len(output_rows)
         now = datetime.now().isoformat()
         with get_connection() as conn:
             conn.execute("""
@@ -312,7 +696,7 @@ def _execute_export(task_id):
                     export_count = ?, completed_at = ? WHERE id = ?
             """, (TASK_STATUS_SUCCESS, file_path, export_count, now, task_id))
             _log_task_operation(conn, task["user_id"], "export_task_success", task_id,
-                                f"导出完成 {filename}, {export_count}条")
+                                f"导出完成 {filename}, 格式={FORMAT_DISPLAY.get(fmt, fmt)}, {export_count}条")
 
     except PermissionError:
         _mark_task_failed(task_id, task["user_id"], "导出目录无写入权限")
@@ -333,104 +717,6 @@ def _mark_task_failed(task_id, user_id, error_message):
         """, (TASK_STATUS_FAILED, error_message, now, task_id))
         _log_task_operation(conn, user_id, "export_task_failed", task_id,
                             f"导出失败: {error_message}", success=False, error_message=error_message)
-
-
-def _write_borrow_csv(file_path, records):
-    fieldnames = [
-        "记录编号", "备件编码", "备件名称", "借用数量", "单位", "单价(元)", "总金额(元)",
-        "借用人", "用途", "状态", "审批人", "审批备注", "审批时间",
-        "借出时间", "已归还数量", "归还时间", "归还备注", "创建时间"
-    ]
-    with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for r in records:
-            status_text = STATUS_DISPLAY.get(r["status"], (r["status"], ""))[0]
-            total_amount = r["quantity"] * r["unit_price"]
-            writer.writerow({
-                "记录编号": r["record_no"],
-                "备件编码": r["part_code"],
-                "备件名称": r["part_name"],
-                "借用数量": r["quantity"],
-                "单位": r["unit"],
-                "单价(元)": r["unit_price"],
-                "总金额(元)": total_amount,
-                "借用人": r["borrower_name"],
-                "用途": r.get("purpose", ""),
-                "状态": status_text,
-                "审批人": r.get("approver_name", "") or "",
-                "审批备注": r.get("approval_remark", "") or "",
-                "审批时间": r.get("approval_at", "") or "",
-                "借出时间": r.get("borrow_at", "") or "",
-                "已归还数量": r["return_quantity"],
-                "归还时间": r.get("return_at", "") or "",
-                "归还备注": r.get("return_remark", "") or "",
-                "创建时间": r["created_at"],
-            })
-    return len(records)
-
-
-def _write_stock_csv(file_path, parts):
-    fieldnames = [
-        "备件编码", "备件名称", "分类", "规格型号", "单位", "单价(元)",
-        "是否需审批", "审批阈值(元)", "总库存", "可用库存",
-        "待审批数量", "已借出数量", "库存状态"
-    ]
-    with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for p in parts:
-            approval_flag = "是" if p["requires_approval"] else "否"
-            if p["available_stock"] > 0:
-                stock_status = f"可借 ({p['available_stock']})"
-            elif p["pending_count"] > 0:
-                stock_status = "待审批"
-            elif p["borrowed_count"] > 0:
-                stock_status = "已借空"
-            else:
-                stock_status = "无库存"
-            writer.writerow({
-                "备件编码": p["part_code"],
-                "备件名称": p["part_name"],
-                "分类": p["category"],
-                "规格型号": p.get("specification", ""),
-                "单位": p["unit"],
-                "单价(元)": p["unit_price"],
-                "是否需审批": approval_flag,
-                "审批阈值(元)": p["approval_threshold"],
-                "总库存": p["total_stock"],
-                "可用库存": p["available_stock"],
-                "待审批数量": p["pending_count"],
-                "已借出数量": p["borrowed_count"],
-                "库存状态": stock_status,
-            })
-    return len(parts)
-
-
-def _write_stock_log_csv(file_path, logs):
-    fieldnames = [
-        "日志ID", "备件编码", "备件名称", "操作类型", "库存变动",
-        "变动前可用", "变动后可用", "操作人", "备注", "操作时间"
-    ]
-    with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for log in logs:
-            op_text = OPERATION_DISPLAY.get(log["operation_type"], (log["operation_type"], ""))[0]
-            change = f"{log['quantity_change']:+d}"
-            writer.writerow({
-                "日志ID": log["id"],
-                "备件编码": log["part_code"],
-                "备件名称": log["part_name"],
-                "操作类型": op_text,
-                "库存变动": change,
-                "变动前可用": log["before_available"],
-                "变动后可用": log["after_available"],
-                "操作人": log["operator_name"],
-                "备注": log.get("remark", "") or "",
-                "操作时间": log["created_at"],
-            })
-    return len(logs)
 
 
 def get_export_task(task_id):
@@ -477,6 +763,18 @@ def get_recent_export_tasks(limit=20):
             WHERE et.status = 'success'
             ORDER BY et.completed_at DESC LIMIT ?
         """, (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_task_operation_logs(task_id, limit=100):
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT ol.*, u.display_name AS operator_name
+            FROM operation_logs ol
+            JOIN users u ON ol.operator_id = u.id
+            WHERE ol.target_type = 'export_task' AND ol.target_id = ?
+            ORDER BY ol.created_at DESC LIMIT ?
+        """, (task_id, limit)).fetchall()
         return [dict(row) for row in rows]
 
 
@@ -531,6 +829,50 @@ def retry_export_task(task_id, user_id):
     return get_export_task(task_id)
 
 
+def resubmit_as_new(task_id, user_id):
+    task = get_export_task(task_id)
+    if not task:
+        raise BusinessException("任务不存在")
+    if task["user_id"] != user_id:
+        raise BusinessException("只能基于自己的任务重新提交")
+
+    filters = _deserialize_filters(task.get("filters_snapshot", "{}"))
+    sort_by = None
+    sort_order = "asc"
+    if task.get("sort_snapshot"):
+        try:
+            sd = json.loads(task["sort_snapshot"])
+            sort_by = sd.get("sort_by")
+            sort_order = sd.get("sort_order", "asc")
+        except Exception:
+            pass
+    page = None
+    page_size = None
+    current_page_only = False
+    if task.get("page_snapshot"):
+        try:
+            pd = json.loads(task["page_snapshot"])
+            page = pd.get("page")
+            page_size = pd.get("page_size")
+            current_page_only = pd.get("export_current_page_only", False)
+        except Exception:
+            pass
+    columns = []
+    if task.get("columns_snapshot"):
+        try:
+            columns = json.loads(task["columns_snapshot"])
+        except Exception:
+            pass
+    fmt = task.get("export_format", FORMAT_CSV)
+
+    snapshot = ExportTaskSnapshot(
+        filters=filters, sort_by=sort_by, sort_order=sort_order,
+        page=page, page_size=page_size, columns=columns,
+        export_format=fmt, export_current_page_only=current_page_only,
+    )
+    return submit_export_task(user_id, task["task_type"], snapshot)
+
+
 def check_download_availability(task_id):
     task = get_export_task(task_id)
     if not task:
@@ -566,7 +908,12 @@ def check_download_availability(task_id):
         except (ValueError, TypeError):
             pass
 
-    return {"available": True, "file_path": file_path, "export_count": task.get("export_count", 0)}
+    return {
+        "available": True,
+        "file_path": file_path,
+        "export_count": task.get("export_count", 0),
+        "export_format": task.get("export_format", FORMAT_CSV),
+    }
 
 
 def verify_export_task_consistency(task_id):
@@ -584,21 +931,47 @@ def verify_export_task_consistency(task_id):
     filters = _deserialize_filters(task["filters_snapshot"])
     current_records = _query_records_for_task(task["task_type"], filters)
 
-    csv_count = 0
+    fmt = task.get("export_format", FORMAT_CSV)
+    file_count = 0
     try:
-        with open(file_path, "r", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-            for _ in reader:
-                csv_count += 1
+        if fmt == FORMAT_XLSX:
+            with zipfile.ZipFile(file_path, "r") as zf:
+                with zf.open("xl/worksheets/sheet1.xml") as f:
+                    content = f.read().decode("utf-8")
+                    file_count = content.count("<row r=") - 1
+        else:
+            with open(file_path, "r", encoding="utf-8-sig") as f:
+                reader = csv.reader(f)
+                next(reader, None)
+                for _ in reader:
+                    file_count += 1
     except Exception as e:
-        return {"consistent": False, "reason": f"读取CSV失败: {e}"}
+        return {"consistent": False, "reason": f"读取导出文件失败: {e}"}
 
-    if csv_count != len(current_records):
+    page = None
+    page_size = None
+    current_page_only = False
+    if task.get("page_snapshot"):
+        try:
+            pd = json.loads(task["page_snapshot"])
+            page = pd.get("page")
+            page_size = pd.get("page_size")
+            current_page_only = pd.get("export_current_page_only", False)
+        except Exception:
+            pass
+    expected_count = len(current_records)
+    if current_page_only and page and page_size:
+        start = (page - 1) * page_size
+        end = start + page_size
+        expected_count = len(current_records[start:end])
+
+    if file_count != expected_count:
         return {
             "consistent": False,
-            "reason": f"数量不一致: 提交时 {task['record_count']} 条, CSV {csv_count} 条, 当前查询 {len(current_records)} 条",
+            "reason": f"数量不一致: 提交时 {task['record_count']} 条, 文件 {file_count} 条, 当前查询 {len(current_records)} 条",
             "task_record_count": task["record_count"],
-            "csv_count": csv_count,
+            "file_count": file_count,
+            "csv_count": file_count,
             "current_count": len(current_records),
         }
 
@@ -608,6 +981,7 @@ def verify_export_task_consistency(task_id):
             "consistent": False,
             "reason": f"源数据已变化: 提交时 {task['record_count']} 条, 当前 {len(current_records)} 条",
             "task_record_count": task["record_count"],
+            "csv_count": file_count,
             "current_count": len(current_records),
         }
 
@@ -615,7 +989,8 @@ def verify_export_task_consistency(task_id):
         "consistent": True,
         "reason": "数据完全一致",
         "task_record_count": task["record_count"],
-        "csv_count": csv_count,
+        "file_count": file_count,
+        "csv_count": file_count,
         "current_count": len(current_records),
     }
 

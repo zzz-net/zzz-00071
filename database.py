@@ -176,6 +176,11 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_export_tasks_type ON export_tasks(task_type)
         """)
 
+        try:
+            cursor.execute("ALTER TABLE export_tasks ADD COLUMN export_format TEXT NOT NULL DEFAULT 'csv'")
+        except sqlite3.OperationalError:
+            pass
+
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_filter_scheme_owner ON filter_schemes(owner_id)
         """)

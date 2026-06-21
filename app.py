@@ -34,6 +34,8 @@ from export_task_center import (
     TASK_TYPE_STOCK, TASK_TYPE_STOCK_LOG,
     TASK_STATUS_PENDING, TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS,
     TASK_STATUS_FAILED, TASK_STATUS_CANCELLED,
+    FORMAT_CSV, FORMAT_XLSX, FORMAT_DISPLAY, EXPORT_FORMATS,
+    get_task_operation_logs, resubmit_as_new,
 )
 
 
@@ -882,7 +884,13 @@ class MainApp(tk.Tk):
         tab = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(tab, text="导出任务中心")
 
-        filter_frame = ttk.LabelFrame(tab, text="任务筛选", padding=8)
+        paned = ttk.Panedwindow(tab, orient="vertical")
+        paned.pack(fill="both", expand=True)
+
+        top_frame = ttk.Frame(paned)
+        paned.add(top_frame, weight=3)
+
+        filter_frame = ttk.LabelFrame(top_frame, text="任务筛选", padding=8)
         filter_frame.pack(fill="x", pady=(0, 8))
 
         frow1 = ttk.Frame(filter_frame)
@@ -905,21 +913,22 @@ class MainApp(tk.Tk):
         self.et_auto_refresh_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(frow1, variable=self.et_auto_refresh_var, text="").pack(side="left")
 
-        task_frame = ttk.LabelFrame(tab, text="导出任务列表", padding=8)
+        task_frame = ttk.LabelFrame(top_frame, text="导出任务列表（全部）", padding=8)
         task_frame.pack(fill="both", expand=True, pady=(0, 8))
 
-        columns = ("task_no", "task_type", "status", "record_count", "export_count",
+        columns = ("task_no", "task_type", "fmt", "status", "record_count", "export_count",
                    "created_at", "completed_at", "error_message")
         self.et_tree = ttk.Treeview(task_frame, columns=columns, show="headings", selectmode="browse")
         headers = [
-            ("task_no", "任务编号", 180),
-            ("task_type", "类型", 80),
-            ("status", "状态", 70),
-            ("record_count", "预计条数", 75),
-            ("export_count", "导出条数", 75),
-            ("created_at", "提交时间", 150),
-            ("completed_at", "完成时间", 150),
-            ("error_message", "错误/说明", 260),
+            ("task_no", "任务编号", 160),
+            ("task_type", "类型", 75),
+            ("fmt", "格式", 55),
+            ("status", "状态", 65),
+            ("record_count", "预计条数", 70),
+            ("export_count", "导出条数", 70),
+            ("created_at", "提交时间", 140),
+            ("completed_at", "完成时间", 140),
+            ("error_message", "错误/说明", 240),
         ]
         for col, text, width in headers:
             self.et_tree.heading(col, text=text)
@@ -934,24 +943,57 @@ class MainApp(tk.Tk):
         self.et_tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
 
-        action_frame = ttk.LabelFrame(tab, text="任务操作", padding=8)
+        action_frame = ttk.LabelFrame(top_frame, text="任务操作", padding=8)
         action_frame.pack(fill="x")
 
         arow1 = ttk.Frame(action_frame)
         arow1.pack(fill="x", pady=3)
-        ttk.Button(arow1, text="提交借还记录导出任务", command=self._et_submit_borrow_task, width=22).pack(side="left", padx=3)
-        ttk.Button(arow1, text="提交库存明细导出任务", command=self._et_submit_stock_task, width=22).pack(side="left", padx=3)
-        ttk.Button(arow1, text="提交库存变动导出任务", command=self._et_submit_stock_log_task, width=22).pack(side="left", padx=3)
+        ttk.Button(arow1, text="提交借还记录导出", command=self._et_submit_borrow_task, width=20).pack(side="left", padx=3)
+        ttk.Button(arow1, text="提交库存明细导出", command=self._et_submit_stock_task, width=20).pack(side="left", padx=3)
+        ttk.Button(arow1, text="提交库存变动导出", command=self._et_submit_stock_log_task, width=20).pack(side="left", padx=3)
 
         arow2 = ttk.Frame(action_frame)
         arow2.pack(fill="x", pady=3)
-        ttk.Button(arow2, text="下载/另存为", command=self._et_download_task, width=14).pack(side="left", padx=3)
-        ttk.Button(arow2, text="校验一致性", command=self._et_verify_task, width=12).pack(side="left", padx=3)
-        ttk.Button(arow2, text="取消任务", command=self._et_cancel_task, width=10).pack(side="left", padx=3)
-        ttk.Button(arow2, text="重试任务", command=self._et_retry_task, width=10).pack(side="left", padx=3)
-        ttk.Button(arow2, text="查看详情", command=self._et_view_detail, width=10).pack(side="left", padx=3)
+        ttk.Button(arow2, text="下载/另存为", command=self._et_download_task, width=12).pack(side="left", padx=3)
+        ttk.Button(arow2, text="校验一致性", command=self._et_verify_task, width=10).pack(side="left", padx=3)
+        ttk.Button(arow2, text="取消任务", command=self._et_cancel_task, width=9).pack(side="left", padx=3)
+        ttk.Button(arow2, text="重试任务", command=self._et_retry_task, width=9).pack(side="left", padx=3)
+        ttk.Button(arow2, text="重新提交(新)", command=self._et_resubmit_task, width=12).pack(side="left", padx=3)
+        ttk.Button(arow2, text="查看详情", command=self._et_view_detail, width=9).pack(side="left", padx=3)
+        ttk.Button(arow2, text="查看操作日志", command=self._et_view_logs, width=12).pack(side="left", padx=3)
 
         self._et_auto_refresh_id = None
+
+        bottom_frame = ttk.Frame(paned)
+        paned.add(bottom_frame, weight=2)
+
+        recent_frame = ttk.LabelFrame(bottom_frame, text="最近成功导出（历史）", padding=8)
+        recent_frame.pack(fill="both", expand=True)
+
+        recent_cols = ("task_no", "task_type", "fmt", "export_count", "completed_at", "file_path")
+        self.et_recent_tree = ttk.Treeview(recent_frame, columns=recent_cols, show="headings", selectmode="browse")
+        recent_headers = [
+            ("task_no", "任务编号", 160),
+            ("task_type", "类型", 80),
+            ("fmt", "格式", 55),
+            ("export_count", "导出条数", 80),
+            ("completed_at", "完成时间", 150),
+            ("file_path", "文件路径", 400),
+        ]
+        for col, text, width in recent_headers:
+            self.et_recent_tree.heading(col, text=text)
+            self.et_recent_tree.column(col, width=width, anchor="w" if col == "file_path" else "center")
+        self.et_recent_tree.tag_configure("success", background="#F0F9EB")
+        self.et_recent_tree.bind("<Double-1>", lambda e: self._et_download_from_recent())
+        rvsb = ttk.Scrollbar(recent_frame, orient="vertical", command=self.et_recent_tree.yview)
+        self.et_recent_tree.configure(yscrollcommand=rvsb.set)
+        self.et_recent_tree.pack(side="left", fill="both", expand=True)
+        rvsb.pack(side="right", fill="y")
+
+        rbtn_frame = ttk.Frame(recent_frame)
+        rbtn_frame.pack(fill="x", pady=(5, 0))
+        ttk.Button(rbtn_frame, text="刷新历史", command=self._et_refresh_recent, width=10).pack(side="left", padx=3)
+        ttk.Button(rbtn_frame, text="从历史下载", command=self._et_download_from_recent, width=12).pack(side="left", padx=3)
 
     def _et_toggle_auto_refresh(self):
         if self.et_auto_refresh_var.get():
@@ -990,6 +1032,7 @@ class MainApp(tk.Tk):
         for t in tasks:
             status_text, _ = EXPORT_TASK_DISPLAY.get(t["status"], (t["status"], ""))
             type_text = TASK_TYPE_DISPLAY.get(t["task_type"], t["task_type"])
+            fmt_text = FORMAT_DISPLAY.get(t.get("export_format", FORMAT_CSV), t.get("export_format", FORMAT_CSV))
             error_msg = t.get("error_message") or ""
             if t["status"] == TASK_STATUS_SUCCESS:
                 error_msg = "导出完成"
@@ -998,13 +1041,35 @@ class MainApp(tk.Tk):
             elif t["status"] == TASK_STATUS_RUNNING:
                 error_msg = "正在导出..."
             self.et_tree.insert("", "end", iid=str(t["id"]), values=(
-                t["task_no"], type_text, status_text,
+                t["task_no"], type_text, fmt_text, status_text,
                 t["record_count"], t.get("export_count", 0),
                 t["created_at"], t.get("completed_at") or "", error_msg
             ), tags=(t["status"],))
 
+        try:
+            self._et_refresh_recent(silent=True)
+        except Exception:
+            pass
+
         if not silent:
             self._set_status(f"导出任务列表已刷新，共 {len(tasks)} 条记录")
+
+    def _et_refresh_recent(self, silent=False):
+        if not self.current_user or not hasattr(self, "et_recent_tree"):
+            return
+        recent = get_recent_export_tasks(limit=20)
+        for item in self.et_recent_tree.get_children():
+            self.et_recent_tree.delete(item)
+        for t in recent:
+            type_text = TASK_TYPE_DISPLAY.get(t["task_type"], t["task_type"])
+            fmt_text = FORMAT_DISPLAY.get(t.get("export_format", FORMAT_CSV), t.get("export_format", FORMAT_CSV))
+            self.et_recent_tree.insert("", "end", iid=str(t["id"]), values=(
+                t["task_no"], type_text, fmt_text,
+                t.get("export_count", 0), t.get("completed_at", ""),
+                t.get("export_file_path", "") or ""
+            ), tags=("success",))
+        if not silent:
+            self._set_status(f"最近导出历史已刷新，共 {len(recent)} 条")
 
     def _et_get_selected_task(self):
         sel = self.et_tree.selection()
@@ -1014,38 +1079,123 @@ class MainApp(tk.Tk):
         task_id = int(sel[0])
         return get_export_task(task_id)
 
+    def _show_export_option_dialog(self, type_title, default_columns=None,
+                                   has_pager=False, default_page=None, default_page_size=None):
+        dlg = tk.Toplevel(self)
+        dlg.title(f"导出设置 - {type_title}")
+        dlg.geometry("420x320")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        result = {"ok": False}
+
+        frame = ttk.Frame(dlg, padding=20)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text=f"导出类型: {type_title}",
+                  font=("Microsoft YaHei", 10, "bold")).pack(anchor="w", pady=(0, 10))
+
+        fmt_frame = ttk.LabelFrame(frame, text="导出格式", padding=10)
+        fmt_frame.pack(fill="x", pady=5)
+        fmt_var = tk.StringVar(value=FORMAT_CSV)
+        ttk.Radiobutton(fmt_frame, text="CSV (通用，推荐)", variable=fmt_var,
+                        value=FORMAT_CSV).pack(side="left", padx=8)
+        ttk.Radiobutton(fmt_frame, text="Excel (xlsx)", variable=fmt_var,
+                        value=FORMAT_XLSX).pack(side="left", padx=8)
+        result["format"] = fmt_var
+
+        page_frame = ttk.LabelFrame(frame, text="导出范围", padding=10)
+        page_frame.pack(fill="x", pady=5)
+        page_only_var = tk.BooleanVar(value=False)
+        page_cb = ttk.Checkbutton(page_frame, variable=page_only_var,
+                                  text="仅导出当前页（不导出全量）")
+        page_cb.pack(anchor="w")
+        if not has_pager:
+            page_cb.configure(state="disabled")
+        result["current_page_only"] = page_only_var
+
+        col_hint = ""
+        if default_columns:
+            col_hint = f"（将按界面列顺序导出共 {len(default_columns)} 列）"
+        ttk.Label(page_frame, text=f"列配置: 使用当前界面列显隐顺序 {col_hint}",
+                  foreground="#606266").pack(anchor="w", pady=(5, 0))
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill="x", pady=15)
+
+        def _on_ok():
+            result["ok"] = True
+            dlg.destroy()
+
+        ttk.Button(btn_frame, text="确定提交", command=_on_ok, width=12).pack(side="right", padx=5)
+        ttk.Button(btn_frame, text="取消", command=dlg.destroy, width=12).pack(side="right")
+
+        self.wait_window(dlg)
+        if not result.get("ok"):
+            return None
+        return {
+            "format": result["format"].get(),
+            "current_page_only": result["current_page_only"].get(),
+        }
+
+    def _try_submit_with_conflict(self, task_type, snapshot, type_title):
+        try:
+            task = submit_export_task(self.current_user["id"], task_type, snapshot)
+            fmt_text = FORMAT_DISPLAY.get(snapshot.export_format, snapshot.export_format)
+            scope_text = "（仅当前页）" if snapshot.export_current_page_only else ""
+            messagebox.showinfo("提交成功",
+                                f"{type_title}导出任务已提交\n"
+                                f"任务编号: {task['task_no']}\n"
+                                f"格式: {fmt_text} {scope_text}\n"
+                                f"预计 {task['record_count']} 条记录\n"
+                                f"请在「导出任务中心」查看进度并下载",
+                                parent=self)
+            self._et_refresh_tasks(silent=True)
+            return True
+        except BusinessException as e:
+            if "冲突" in e.message or "相同条件" in e.message:
+                if messagebox.askyesno("冲突提示",
+                                       f"{e.message}\n\n是否强制提交（将取消已有同条件任务）？",
+                                       parent=self):
+                    try:
+                        task = submit_export_task(self.current_user["id"], task_type, snapshot, force=True)
+                        fmt_text = FORMAT_DISPLAY.get(snapshot.export_format, snapshot.export_format)
+                        messagebox.showinfo("提交成功",
+                                            f"已强制提交\n任务编号: {task['task_no']}\n"
+                                            f"格式: {fmt_text}\n预计 {task['record_count']} 条记录",
+                                            parent=self)
+                        self._et_refresh_tasks(silent=True)
+                        return True
+                    except BusinessException as ex:
+                        messagebox.showerror("提交失败", ex.message, parent=self)
+                        return False
+            else:
+                messagebox.showerror("提交失败", e.message, parent=self)
+                return False
+
     def _et_submit_borrow_task(self):
         if not self.current_user:
             return
         filters = self._collect_wb_filters()
+        columns = list(self.wb_tree["columns"]) if hasattr(self, 'wb_tree') else []
+        opts = self._show_export_option_dialog(
+            "借还记录", default_columns=columns,
+            has_pager=True, default_page=self._wb_current_page,
+            default_page_size=self.wb_page_size_var.get(),
+        )
+        if not opts:
+            return
         snapshot = ExportTaskSnapshot(
             filters=filters,
             sort_by=self.wb_sort_by,
             sort_order=self.wb_sort_order,
             page=self._wb_current_page,
             page_size=self.wb_page_size_var.get(),
+            columns=columns,
+            export_format=opts["format"],
+            export_current_page_only=opts["current_page_only"],
         )
-        try:
-            task = submit_export_task(self.current_user["id"], TASK_TYPE_BORROW, snapshot)
-            messagebox.showinfo("提交成功",
-                                f"导出任务已提交\n任务编号: {task['task_no']}\n预计 {task['record_count']} 条记录\n"
-                                f"请到「导出任务中心」查看进度", parent=self)
-            self._et_refresh_tasks(silent=True)
-        except BusinessException as e:
-            if "冲突" in e.message or "相同条件" in e.message:
-                if messagebox.askyesno("冲突提示",
-                                       f"{e.message}\n\n是否强制提交（将取消已有任务）？",
-                                       parent=self):
-                    try:
-                        task = submit_export_task(self.current_user["id"], TASK_TYPE_BORROW, snapshot, force=True)
-                        messagebox.showinfo("提交成功",
-                                            f"导出任务已强制提交\n任务编号: {task['task_no']}\n"
-                                            f"预计 {task['record_count']} 条记录", parent=self)
-                        self._et_refresh_tasks(silent=True)
-                    except BusinessException as ex:
-                        messagebox.showerror("提交失败", ex.message, parent=self)
-            else:
-                messagebox.showerror("提交失败", e.message, parent=self)
+        self._try_submit_with_conflict(TASK_TYPE_BORROW, snapshot, "借还记录")
 
     def _et_submit_stock_task(self):
         if not self.current_user:
@@ -1057,24 +1207,16 @@ class MainApp(tk.Tk):
             filters["keyword"] = keyword
         if category:
             filters["category"] = category
-        snapshot = ExportTaskSnapshot(filters=filters)
-        try:
-            task = submit_export_task(self.current_user["id"], TASK_TYPE_STOCK, snapshot)
-            messagebox.showinfo("提交成功",
-                                f"导出任务已提交\n任务编号: {task['task_no']}\n预计 {task['record_count']} 条记录",
-                                parent=self)
-            self._et_refresh_tasks(silent=True)
-        except BusinessException as e:
-            if "冲突" in e.message or "相同条件" in e.message:
-                if messagebox.askyesno("冲突提示", f"{e.message}\n\n是否强制提交？", parent=self):
-                    try:
-                        task = submit_export_task(self.current_user["id"], TASK_TYPE_STOCK, snapshot, force=True)
-                        messagebox.showinfo("提交成功", f"任务编号: {task['task_no']}", parent=self)
-                        self._et_refresh_tasks(silent=True)
-                    except BusinessException as ex:
-                        messagebox.showerror("提交失败", ex.message, parent=self)
-            else:
-                messagebox.showerror("提交失败", e.message, parent=self)
+        columns = list(self.parts_tree["columns"]) if hasattr(self, 'parts_tree') else []
+        opts = self._show_export_option_dialog("库存明细", default_columns=columns)
+        if not opts:
+            return
+        snapshot = ExportTaskSnapshot(
+            filters=filters, columns=columns,
+            export_format=opts["format"],
+            export_current_page_only=False,
+        )
+        self._try_submit_with_conflict(TASK_TYPE_STOCK, snapshot, "库存明细")
 
     def _et_submit_stock_log_task(self):
         if not self.current_user:
@@ -1084,24 +1226,41 @@ class MainApp(tk.Tk):
         filters = {}
         if part_id:
             filters["part_id"] = part_id
-        snapshot = ExportTaskSnapshot(filters=filters)
+        columns = list(self.history_tree["columns"]) if hasattr(self, 'history_tree') else []
+        opts = self._show_export_option_dialog("库存变动", default_columns=columns)
+        if not opts:
+            return
+        snapshot = ExportTaskSnapshot(
+            filters=filters, columns=columns,
+            export_format=opts["format"],
+            export_current_page_only=False,
+        )
+        self._try_submit_with_conflict(TASK_TYPE_STOCK_LOG, snapshot, "库存变动")
+
+    def _do_download_file(self, src_path, fmt, export_count):
+        ext = "xlsx" if fmt == FORMAT_XLSX else "csv"
+        ft_name = "Excel文件" if fmt == FORMAT_XLSX else "CSV文件"
+        save_path = filedialog.asksaveasfilename(
+            parent=self, title="保存导出文件",
+            defaultextension=f".{ext}",
+            initialfile=os.path.basename(src_path),
+            filetypes=[(f"{ft_name}", f"*.{ext}")]
+        )
+        if not save_path:
+            return False
         try:
-            task = submit_export_task(self.current_user["id"], TASK_TYPE_STOCK_LOG, snapshot)
-            messagebox.showinfo("提交成功",
-                                f"导出任务已提交\n任务编号: {task['task_no']}\n预计 {task['record_count']} 条记录",
+            import shutil as sh
+            sh.copy2(src_path, save_path)
+            messagebox.showinfo("下载成功",
+                                f"文件已保存到:\n{save_path}\n共 {export_count} 条记录",
                                 parent=self)
-            self._et_refresh_tasks(silent=True)
-        except BusinessException as e:
-            if "冲突" in e.message or "相同条件" in e.message:
-                if messagebox.askyesno("冲突提示", f"{e.message}\n\n是否强制提交？", parent=self):
-                    try:
-                        task = submit_export_task(self.current_user["id"], TASK_TYPE_STOCK_LOG, snapshot, force=True)
-                        messagebox.showinfo("提交成功", f"任务编号: {task['task_no']}", parent=self)
-                        self._et_refresh_tasks(silent=True)
-                    except BusinessException as ex:
-                        messagebox.showerror("提交失败", ex.message, parent=self)
-            else:
-                messagebox.showerror("提交失败", e.message, parent=self)
+            return True
+        except PermissionError:
+            messagebox.showerror("下载失败", "目标目录无写入权限，请选择其他目录", parent=self)
+            return False
+        except Exception as e:
+            messagebox.showerror("下载失败", f"保存文件失败: {e}", parent=self)
+            return False
 
     def _et_download_task(self):
         task = self._et_get_selected_task()
@@ -1111,24 +1270,46 @@ class MainApp(tk.Tk):
         if not avail["available"]:
             messagebox.showwarning("无法下载", avail["reason"], parent=self)
             return
+        fmt = avail.get("export_format", FORMAT_CSV)
+        self._do_download_file(avail["file_path"], fmt, avail["export_count"])
 
-        src_path = avail["file_path"]
-        save_path = filedialog.asksaveasfilename(
-            parent=self, title="保存导出文件", defaultextension=".csv",
-            initialfile=os.path.basename(src_path), filetypes=[("CSV文件", "*.csv")]
-        )
-        if not save_path:
+    def _et_download_from_recent(self):
+        if not hasattr(self, "et_recent_tree"):
+            return
+        sel = self.et_recent_tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先从历史列表选择一条记录", parent=self)
+            return
+        task_id = int(sel[0])
+        avail = check_download_availability(task_id)
+        if not avail["available"]:
+            messagebox.showwarning("无法下载", avail["reason"], parent=self)
+            return
+        fmt = avail.get("export_format", FORMAT_CSV)
+        self._do_download_file(avail["file_path"], fmt, avail["export_count"])
+
+    def _et_resubmit_task(self):
+        task = self._et_get_selected_task()
+        if not task:
+            return
+        status_label = EXPORT_TASK_DISPLAY.get(task["status"], (task["status"], ""))[0]
+        if not messagebox.askyesno("确认重新提交",
+                                   f"将以相同的筛选/排序/列/分页/格式条件\n"
+                                   f"基于任务 {task['task_no']}（{status_label}）\n"
+                                   f"重新生成一条全新导出任务，是否继续？",
+                                   parent=self):
             return
         try:
-            import shutil as sh
-            sh.copy2(src_path, save_path)
-            messagebox.showinfo("下载成功",
-                                f"文件已保存到:\n{save_path}\n共 {avail['export_count']} 条记录",
+            new_task = resubmit_as_new(task["id"], self.current_user["id"])
+            fmt_text = FORMAT_DISPLAY.get(new_task.get("export_format", FORMAT_CSV),
+                                          new_task.get("export_format", FORMAT_CSV))
+            messagebox.showinfo("提交成功",
+                                f"已以相同条件重新提交\n新任务编号: {new_task['task_no']}\n"
+                                f"格式: {fmt_text}\n预计 {new_task['record_count']} 条",
                                 parent=self)
-        except PermissionError:
-            messagebox.showerror("下载失败", "目标目录无写入权限，请选择其他目录", parent=self)
-        except Exception as e:
-            messagebox.showerror("下载失败", f"保存文件失败: {e}", parent=self)
+            self._et_refresh_tasks()
+        except BusinessException as e:
+            messagebox.showerror("提交失败", e.message, parent=self)
 
     def _et_verify_task(self):
         task = self._et_get_selected_task()
@@ -1137,12 +1318,14 @@ class MainApp(tk.Tk):
         if task["status"] != TASK_STATUS_SUCCESS:
             messagebox.showwarning("提示", "只有已完成的任务可以校验一致性", parent=self)
             return
+        fmt = task.get("export_format", FORMAT_CSV)
+        fmt_label = "Excel文件" if fmt == FORMAT_XLSX else "CSV文件"
         result = verify_export_task_consistency(task["id"])
         if result["consistent"]:
             messagebox.showinfo("校验通过",
                                 f"导出文件与提交任务时完全一致！\n"
                                 f"提交时: {result.get('task_record_count', '?')} 条\n"
-                                f"CSV文件: {result.get('csv_count', '?')} 条\n"
+                                f"{fmt_label}: {result.get('csv_count', '?')} 条\n"
                                 f"当前查询: {result.get('current_count', '?')} 条",
                                 parent=self)
         else:
@@ -1180,9 +1363,12 @@ class MainApp(tk.Tk):
             return
         status_text, _ = EXPORT_TASK_DISPLAY.get(task["status"], (task["status"], ""))
         type_text = TASK_TYPE_DISPLAY.get(task["task_type"], task["task_type"])
+        fmt_text = FORMAT_DISPLAY.get(task.get("export_format", FORMAT_CSV),
+                                      task.get("export_format", FORMAT_CSV))
         detail_lines = [
             f"任务编号: {task['task_no']}",
             f"任务类型: {type_text}",
+            f"导出格式: {fmt_text}",
             f"状态: {status_text}",
             f"提交时间: {task['created_at']}",
             f"预计条数: {task['record_count']}",
@@ -1198,49 +1384,121 @@ class MainApp(tk.Tk):
         if task.get("error_message"):
             detail_lines.append(f"错误信息: {task['error_message']}")
 
-        filters_raw = task.get("filters_snapshot", "{}")
+        import json
+        all_config = {}
         try:
-            import json
-            filters = json.loads(filters_raw) if isinstance(filters_raw, str) else filters_raw
-            detail_lines.append(f"\n筛选条件: {json.dumps(filters, ensure_ascii=False)}")
+            filters = json.loads(task.get("filters_snapshot", "{}"))
+            if filters:
+                all_config["筛选条件"] = filters
         except Exception:
-            detail_lines.append(f"\n筛选条件: {filters_raw}")
+            all_config["筛选条件"] = task.get("filters_snapshot", "")
 
         sort_raw = task.get("sort_snapshot")
         if sort_raw:
             try:
-                import json
                 sort = json.loads(sort_raw) if isinstance(sort_raw, str) else sort_raw
-                detail_lines.append(f"排序: {json.dumps(sort, ensure_ascii=False)}")
+                if sort:
+                    all_config["排序"] = sort
             except Exception:
-                detail_lines.append(f"排序: {sort_raw}")
+                all_config["排序"] = sort_raw
 
         page_raw = task.get("page_snapshot")
         if page_raw:
             try:
-                import json
                 page = json.loads(page_raw) if isinstance(page_raw, str) else page_raw
-                detail_lines.append(f"分页: {json.dumps(page, ensure_ascii=False)}")
+                if page:
+                    all_config["分页"] = page
             except Exception:
-                detail_lines.append(f"分页: {page_raw}")
+                all_config["分页"] = page_raw
+
+        cols_raw = task.get("column_snapshot")
+        if cols_raw:
+            try:
+                cols = json.loads(cols_raw) if isinstance(cols_raw, str) else cols_raw
+                if cols:
+                    all_config["导出列顺序"] = cols
+            except Exception:
+                all_config["导出列顺序"] = cols_raw
+
+        fp = task.get("record_fingerprint")
+        if fp:
+            all_config["数据指纹"] = fp[:16] + "..."
+
+        detail_lines.append(f"\n=== 任务快照（已固化，生成时使用） ===")
+        detail_lines.append(json.dumps(all_config, ensure_ascii=False, indent=2))
 
         if task.get("export_file_path"):
             detail_lines.append(f"\n导出文件: {task['export_file_path']}")
 
         dlg = tk.Toplevel(self)
         dlg.title(f"任务详情 - {task['task_no']}")
-        dlg.geometry("520x450")
+        dlg.geometry("580x520")
         dlg.resizable(False, False)
         dlg.transient(self)
         dlg.grab_set()
         frame = ttk.Frame(dlg, padding=15)
         frame.pack(fill="both", expand=True)
-        text_widget = tk.Text(frame, width=58, height=22, font=("Microsoft YaHei", 9))
-        text_widget.pack(fill="both", expand=True)
+        text_widget = tk.Text(frame, width=64, height=28, font=("Consolas", 9))
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=text_widget.yview)
+        text_widget.configure(yscrollcommand=scroll.set)
+        text_widget.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
         text_widget.insert("1.0", "\n".join(detail_lines))
         text_widget.configure(state="disabled")
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack(fill="x", pady=(10, 0))
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.pack(fill="x", padx=15, pady=(0, 15))
+        ttk.Button(btn_frame, text="关闭", command=dlg.destroy, width=12).pack(side="right")
+
+    def _et_view_logs(self):
+        task = self._et_get_selected_task()
+        if not task:
+            return
+        try:
+            logs = get_task_operation_logs(task["id"])
+        except Exception as e:
+            messagebox.showerror("错误", f"读取操作日志失败: {e}", parent=self)
+            return
+
+        dlg = tk.Toplevel(self)
+        dlg.title(f"任务操作日志 - {task['task_no']}")
+        dlg.geometry("760x420")
+        dlg.transient(self)
+        dlg.grab_set()
+        frame = ttk.Frame(dlg, padding=10)
+        frame.pack(fill="both", expand=True)
+
+        cols = ("no", "time", "action", "success", "detail", "error")
+        tree = ttk.Treeview(frame, columns=cols, show="headings", height=16)
+        headers = [
+            ("no", "序号", 50),
+            ("time", "时间", 140),
+            ("action", "操作", 120),
+            ("success", "结果", 60),
+            ("detail", "详情", 280),
+            ("error", "错误/提示", 200),
+        ]
+        for c, t, w in headers:
+            tree.heading(c, text=t)
+            tree.column(c, width=w, anchor="center" if c in ("no", "success") else "w")
+        tree.tag_configure("ok", background="#F0F9EB")
+        tree.tag_configure("fail", background="#FEF0F0")
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        for idx, lg in enumerate(logs, 1):
+            ok_tag = "ok" if lg.get("success") else "fail"
+            ok_text = "成功" if lg.get("success") else "失败"
+            tree.insert("", "end", values=(
+                idx, lg.get("created_at", ""), lg.get("action", ""), ok_text,
+                lg.get("detail", "") or "", lg.get("error_message", "") or ""
+            ), tags=(ok_tag,))
+
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Label(btn_frame, text=f"共 {len(logs)} 条操作日志",
+                  foreground="#606266").pack(side="left")
         ttk.Button(btn_frame, text="关闭", command=dlg.destroy, width=12).pack(side="right")
 
     def _build_logs_tab(self):
@@ -1889,39 +2147,29 @@ class MainApp(tk.Tk):
                 self.active_scheme_label.configure(text="")
 
     def _wb_export_csv(self):
+        if not self.current_user:
+            return
         filters = self._collect_wb_filters()
+        columns = list(self.wb_tree["columns"]) if hasattr(self, 'wb_tree') else []
+        opts = self._show_export_option_dialog(
+            "工作台借还记录", default_columns=columns,
+            has_pager=True, default_page=self._wb_current_page,
+            default_page_size=self.wb_page_size_var.get(),
+        )
+        if not opts:
+            return
         snapshot = ExportTaskSnapshot(
             filters=filters,
             sort_by=self.wb_sort_by,
             sort_order=self.wb_sort_order,
             page=self._wb_current_page,
             page_size=self.wb_page_size_var.get(),
+            columns=columns,
+            export_format=opts["format"],
+            export_current_page_only=opts["current_page_only"],
         )
-        try:
-            task = submit_export_task(self.current_user["id"], TASK_TYPE_BORROW, snapshot)
-            self.wb_verify_result_label.configure(text="", foreground="#67C23A")
-            messagebox.showinfo("任务已提交",
-                                f"导出任务已提交到任务中心\n任务编号: {task['task_no']}\n"
-                                f"预计 {task['record_count']} 条记录\n"
-                                f"请在「导出任务中心」查看进度并下载",
-                                parent=self)
-            self._et_refresh_tasks(silent=True)
-        except BusinessException as e:
-            if "冲突" in e.message or "相同条件" in e.message:
-                if messagebox.askyesno("冲突提示",
-                                       f"{e.message}\n\n是否强制提交（将取消已有任务）？",
-                                       parent=self):
-                    try:
-                        task = submit_export_task(self.current_user["id"], TASK_TYPE_BORROW, snapshot, force=True)
-                        messagebox.showinfo("任务已提交",
-                                            f"导出任务已强制提交\n任务编号: {task['task_no']}\n"
-                                            f"预计 {task['record_count']} 条记录",
-                                            parent=self)
-                        self._et_refresh_tasks(silent=True)
-                    except BusinessException as ex:
-                        messagebox.showerror("提交失败", ex.message, parent=self)
-            else:
-                messagebox.showerror("提交失败", e.message, parent=self)
+        self.wb_verify_result_label.configure(text="", foreground="#67C23A")
+        self._try_submit_with_conflict(TASK_TYPE_BORROW, snapshot, "工作台借还记录")
 
     def _wb_verify_export(self):
         if not self._wb_last_export_path or not os.path.exists(self._wb_last_export_path):
@@ -2497,34 +2745,16 @@ class MainApp(tk.Tk):
             filters["keyword"] = keyword
         if category:
             filters["category"] = category
-        snapshot = ExportTaskSnapshot(filters=filters)
-        try:
-            task = submit_export_task(self.current_user["id"], TASK_TYPE_STOCK, snapshot)
-            messagebox.showinfo("任务已提交",
-                                f"库存明细导出任务已提交到任务中心\n任务编号: {task['task_no']}\n"
-                                f"预计 {task['record_count']} 条记录\n"
-                                f"请在「导出任务中心」查看进度并下载",
-                                parent=self)
-            self._et_refresh_tasks(silent=True)
-        except BusinessException as e:
-            self._handle_export_conflict(e, TASK_TYPE_STOCK, snapshot)
-
-    def _handle_export_conflict(self, e, task_type, snapshot):
-        if "冲突" in e.message or "相同条件" in e.message:
-            if messagebox.askyesno("冲突提示",
-                                   f"{e.message}\n\n是否强制提交（将取消已有任务）？",
-                                   parent=self):
-                try:
-                    task = submit_export_task(self.current_user["id"], task_type, snapshot, force=True)
-                    messagebox.showinfo("任务已提交",
-                                        f"导出任务已强制提交\n任务编号: {task['task_no']}\n"
-                                        f"预计 {task['record_count']} 条记录",
-                                        parent=self)
-                    self._et_refresh_tasks(silent=True)
-                except BusinessException as ex:
-                    messagebox.showerror("提交失败", ex.message, parent=self)
-        else:
-            messagebox.showerror("提交失败", e.message, parent=self)
+        columns = list(self.parts_tree["columns"]) if hasattr(self, 'parts_tree') else []
+        opts = self._show_export_option_dialog("库存明细", default_columns=columns)
+        if not opts:
+            return
+        snapshot = ExportTaskSnapshot(
+            filters=filters, columns=columns,
+            export_format=opts["format"],
+            export_current_page_only=False,
+        )
+        self._try_submit_with_conflict(TASK_TYPE_STOCK, snapshot, "库存明细")
 
     def _export_borrow(self):
         if not self.current_user:
@@ -2549,25 +2779,15 @@ class MainApp(tk.Tk):
         if date_to:
             filters["date_to"] = date_to
         columns = list(self.borrow_tree["columns"]) if hasattr(self, 'borrow_tree') else []
+        opts = self._show_export_option_dialog("借还记录", default_columns=columns)
+        if not opts:
+            return
         snapshot = ExportTaskSnapshot(
-            filters=filters,
-            columns=columns,
+            filters=filters, columns=columns,
+            export_format=opts["format"],
+            export_current_page_only=False,
         )
-        try:
-            task = submit_export_task(self.current_user["id"], TASK_TYPE_BORROW, snapshot)
-            scheme_note = ""
-            if self.active_scheme_id:
-                scheme = get_filter_scheme_by_id(self.active_scheme_id)
-                if scheme:
-                    scheme_note = f"\n筛选方案: 「{scheme['name']}」"
-            messagebox.showinfo("任务已提交",
-                                f"借还记录导出任务已提交到任务中心\n任务编号: {task['task_no']}\n"
-                                f"预计 {task['record_count']} 条记录{scheme_note}\n"
-                                f"请在「导出任务中心」查看进度并下载",
-                                parent=self)
-            self._et_refresh_tasks(silent=True)
-        except BusinessException as e:
-            self._handle_export_conflict(e, TASK_TYPE_BORROW, snapshot)
+        self._try_submit_with_conflict(TASK_TYPE_BORROW, snapshot, "借还记录")
 
     def _export_history(self):
         if not self.current_user:
@@ -2578,20 +2798,15 @@ class MainApp(tk.Tk):
         if part_id:
             filters["part_id"] = part_id
         columns = list(self.history_tree["columns"]) if hasattr(self, 'history_tree') else []
+        opts = self._show_export_option_dialog("库存变动", default_columns=columns)
+        if not opts:
+            return
         snapshot = ExportTaskSnapshot(
-            filters=filters,
-            columns=columns,
+            filters=filters, columns=columns,
+            export_format=opts["format"],
+            export_current_page_only=False,
         )
-        try:
-            task = submit_export_task(self.current_user["id"], TASK_TYPE_STOCK_LOG, snapshot)
-            messagebox.showinfo("任务已提交",
-                                f"库存变动导出任务已提交到任务中心\n任务编号: {task['task_no']}\n"
-                                f"预计 {task['record_count']} 条记录\n"
-                                f"请在「导出任务中心」查看进度并下载",
-                                parent=self)
-            self._et_refresh_tasks(silent=True)
-        except BusinessException as e:
-            self._handle_export_conflict(e, TASK_TYPE_STOCK_LOG, snapshot)
+        self._try_submit_with_conflict(TASK_TYPE_STOCK_LOG, snapshot, "库存变动")
 
     def _set_status(self, text):
         self.status_label.configure(text=text)
